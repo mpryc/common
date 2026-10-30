@@ -39,7 +39,13 @@ func MergeReboots(docs ...*Document) []RebootEntry {
 			continue
 		}
 		for _, entry := range d.Reboots {
-			if entry.Remediation == nil {
+			// A reference with no UID is not an identity. Collapsing on it
+			// would fold every such record into one — three remediations
+			// counted as one reboot — and under-counting a budget is how a
+			// reboot loop escapes its brake. Keep the record, keep it
+			// distinguishable as requested rather than autonomous, and
+			// simply never merge it with anything.
+			if !entry.Remediation.identifies() {
 				merged = append(merged, entry.clone())
 				continue
 			}

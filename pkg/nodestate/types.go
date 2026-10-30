@@ -2,6 +2,7 @@ package nodestate
 
 import (
 	"encoding/json"
+	"fmt"
 	"reflect"
 	"strconv"
 	"time"
@@ -290,9 +291,33 @@ type CRRef struct {
 // can be carried out by two different agents recording two different kinds for
 // the same underlying request; counting it twice would halve an operator's
 // effective reboot budget.
+//
+// Key is only meaningful for a reference that satisfies Validate. Without a
+// UID every reference produces the same key, which is why MergeReboots
+// refuses to de-duplicate on one.
 func (r CRRef) Key() string {
 	return r.UID + "@" + strconv.FormatInt(r.Generation, 10)
 }
+
+// Validate reports whether the reference can identify a remediation.
+//
+// The UID is the whole of the identity. A reference carrying a kind and a
+// name but no UID looks informative and is not: a node health check names the
+// remediation resource after the node, so the same name is reused for every
+// episode on that node and distinguishes nothing.
+func (r CRRef) Validate() error {
+	if r.UID == "" {
+		return fmt.Errorf("%w: a remediation reference needs a UID; kind %q and name %q do not identify one",
+			ErrInvalidReference, r.Kind, r.Name)
+	}
+	if r.Generation < 0 {
+		return fmt.Errorf("%w: generation %d is negative", ErrInvalidReference, r.Generation)
+	}
+	return nil
+}
+
+// identifies reports whether this reference may be de-duplicated on.
+func (r *CRRef) identifies() bool { return r != nil && r.Validate() == nil }
 
 // NewDocument returns an empty document owned by c, stamped with the current
 // schema version. It is what Store.Load hands back when there is no file, or
@@ -443,8 +468,34 @@ func (d *Document) AppendEvent(e EventEntry) {
 
 // AppendReboot adds one reboot record. Records are never de-duplicated here:
 // use MergeReboots when counting across files.
+//
+// A Remediation reference with no UID is dropped and the record is kept as an
+// autonomous reboot. Storing it would be worse than useless: it cannot be
+// matched to the remediation it served, it cannot be reconciled with the
+// peer's record of the same reboot, and it would be charged to a requested
+// budget it can never be settled against. Use AppendRebootChecked at a call
+// site that would rather be told.
 func (d *Document) AppendReboot(e RebootEntry) {
+	if e.Remediation != nil && !e.Remediation.identifies() {
+		e.Remediation = nil
+	}
 	d.Reboots = append(d.Reboots, e)
+}
+
+// AppendRebootChecked is AppendReboot that reports a malformed remediation
+// reference instead of silently dropping it.
+//
+// Prefer it wherever the reference is built from a live resource, because an
+// empty UID there means the caller read the wrong field and the record would
+// otherwise be filed as autonomous without anyone noticing.
+func (d *Document) AppendRebootChecked(e RebootEntry) error {
+	if e.Remediation != nil {
+		if err := e.Remediation.Validate(); err != nil {
+			return err
+		}
+	}
+	d.Reboots = append(d.Reboots, e)
+	return nil
 }
 
 // SetCondition inserts or replaces the entry with the same Type.

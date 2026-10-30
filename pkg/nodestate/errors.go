@@ -24,6 +24,10 @@ var (
 	// ErrInvalidComponent means a Component is not a safe, single path element.
 	ErrInvalidComponent = errors.New("nodestate: invalid component name")
 
+	// ErrInvalidReference means a CRRef cannot identify a remediation, almost
+	// always because its UID is empty. See CRRef.Validate.
+	ErrInvalidReference = errors.New("nodestate: invalid remediation reference")
+
 	// ErrNotOwner means a write was attempted against a file this Store does
 	// not own. Single-writer ownership is what makes the lock-free atomic
 	// replace safe, so the library refuses rather than warns.
