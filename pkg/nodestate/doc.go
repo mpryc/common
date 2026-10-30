@@ -181,12 +181,25 @@
 //
 // Across processes, the single-writer rule is a contract this library cannot
 // enforce — nothing stops a second process opening the same path. What it
-// does instead is detect the violation: each Store stamps a random WriterID
-// and an increasing Revision, and Load reports LoadResult.ForeignWrite when
-// the file came from someone else. The default is to report and carry on,
-// because stalling a fencing agent is worse than overwriting a record that
-// should not exist; WithStrictOwnership inverts that for callers who would
-// rather fail.
+// does instead is detect the violation. Each write stamps an identity built
+// from the kernel boot id, the process id and the process start time, plus
+// an increasing revision, and Load reports LoadResult.ForeignWrite when the
+// file came from someone else.
+//
+// It reports and carries on. It never refuses to write, and there is no
+// option to make it: an agent that stops recording because it suspects a
+// second writer is worse than one that overwrites a record which should not
+// have existed. Refusing would also reintroduce, at start-up, exactly the
+// liveness hazard the lock-free design exists to avoid — a predecessor stuck
+// in uninterruptible sleep would keep its replacement from ever starting.
+//
+// Deployments must still hold up their end. Set maxSurge to 0 on any
+// DaemonSet running an agent, so a rolling update never runs two at once.
+// That is the Kubernetes default for a DaemonSet, so it holds unless someone
+// changes it — which is a reason to set it explicitly rather than to rely on
+// it. One window remains open regardless: a pod stuck terminating, which is
+// what a storage fault produces, can have its pod object force-deleted while
+// the container is still alive. ForeignWrite is how that becomes visible.
 //
 // None of these operations is cancellable. The context is checked before work
 // begins, but a file operation in progress cannot be interrupted, and on a

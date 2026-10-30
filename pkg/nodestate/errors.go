@@ -78,8 +78,9 @@ var (
 	ErrDurabilityUnconfirmed = errors.New("nodestate: write is visible but its durability is unconfirmed")
 
 	// ErrForeignWrite means the file this Store owns was last written by
-	// someone else. This must never happen; see Store.Load and
-	// WithStrictOwnership for what the library does when it does.
+	// another process. This must never happen under the single-writer
+	// contract; see Store.Load for how it is reported and why the library
+	// carries on rather than refusing.
 	ErrForeignWrite = errors.New("nodestate: state file was modified by another writer")
 
 	// ErrBootIDUnavailable means the kernel boot identifier could not be read

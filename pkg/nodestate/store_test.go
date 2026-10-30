@@ -789,10 +789,18 @@ func TestUpdate_ReportsForeignModification(t *testing.T) {
 	}
 }
 
-func TestUpdate_StrictOwnershipFailsOnForeignModification(t *testing.T) {
+// TestUpdate_NeverRefusesOnAForeignWrite pins the decision that there is no
+// strict mode.
+//
+// Refusing to write because another process touched the file would stall a
+// fencing agent on the strength of a condition it cannot verify, and at
+// start-up it would let a predecessor stuck in uninterruptible sleep keep its
+// replacement from ever running — the exact liveness hazard the lock-free
+// design exists to avoid.
+func TestUpdate_NeverRefusesOnAForeignWrite(t *testing.T) {
 	t.Parallel()
 
-	s, dir := newStore(t, nodestate.ComponentSBR, nodestate.WithStrictOwnership(true))
+	s, dir := newStore(t, nodestate.ComponentSBR)
 	ctx := context.Background()
 
 	if _, err := s.Update(ctx, func(d *nodestate.Document) error { d.Node = "worker-0"; return nil }); err != nil {
@@ -800,14 +808,25 @@ func TestUpdate_StrictOwnershipFailsOnForeignModification(t *testing.T) {
 	}
 
 	foreign := nodestate.NewDocument(nodestate.ComponentSBR)
-	foreign.WriterID = "some-other-process"
+	foreign.WriterID = "some-other-boot/999/1"
 	foreign.Revision = 97
 	raw, _ := json.Marshal(foreign)
 	mustWrite(t, filepath.Join(dir, nodestate.SBRFile), string(raw))
 
-	_, err := s.Update(ctx, func(d *nodestate.Document) error { return nil })
-	if !errors.Is(err, nodestate.ErrForeignWrite) {
-		t.Fatalf("Update error = %v, want ErrForeignWrite under strict ownership", err)
+	res, err := s.Load(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !res.ForeignWrite {
+		t.Error("ForeignWrite = false; the violation must at least be visible")
+	}
+
+	doc, err := s.Update(ctx, func(d *nodestate.Document) error { d.Node = "worker-0"; return nil })
+	if err != nil {
+		t.Fatalf("Update refused after a foreign write: %v", err)
+	}
+	if doc.Revision != 98 {
+		t.Errorf("Revision = %d, want 98: the sequence must continue from what is on disk", doc.Revision)
 	}
 }
 

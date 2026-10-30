@@ -170,7 +170,6 @@ func TestOptions_AcceptValidValues(t *testing.T) {
 		nodestate.WithMaxDocumentBytes(1<<16),
 		nodestate.WithMaxReadBytes(1<<16),
 		nodestate.WithQuarantineRetention(1),
-		nodestate.WithStrictOwnership(false),
 	)
 	if err != nil {
 		t.Fatalf("New: %v", err)

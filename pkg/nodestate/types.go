@@ -155,8 +155,14 @@ type AgentState struct {
 	Component Component `json:"component,omitempty"`
 	// Version is the agent's build version, for post-mortem correlation.
 	Version string `json:"version,omitempty"`
-	// PID is the writing process id. It distinguishes an agent restart from a
-	// node reboot when BootID is unchanged.
+	// PID is the writing process id. With BootID and StartedAt it identifies
+	// the process, which is what makes a second live writer recognisable
+	// rather than merely suspected.
+	//
+	// Store.Write stamps it. A reader seeing a PID other than its own, from
+	// the same boot, is looking at a file another process owns — which the
+	// single-writer contract forbids and which a DaemonSet surge or a pod
+	// stuck terminating can produce.
 	PID int `json:"pid,omitempty"`
 	// StartedAt is when the writing process started.
 	//

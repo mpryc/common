@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
+	"os"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -214,7 +215,6 @@ type Store struct {
 	quarantineRetention int
 	quarantineMaxAge    time.Duration
 	orphanGrace         time.Duration
-	strictOwnership     bool
 	writerID            string
 
 	// mu serialises read-modify-write cycles on this file. It is held across
@@ -250,6 +250,56 @@ func lockForPath(path string) *sync.Mutex {
 	return actual.(*sync.Mutex)
 }
 
+// processIdentity is this process's identity as a writer, resolved once.
+//
+// It has to identify the *process*, not the Store. A random value per Store
+// made two Stores in one process — a pattern the shared lock above already
+// makes safe — report each other as foreign writes, and it made the identity
+// meaningless across a restart, where it was most needed: a new value every
+// time is indistinguishable from someone else's value.
+//
+// Boot id, PID and start time together are enough. The boot id separates two
+// nodes and two boots of the same node; the PID separates two processes on
+// one boot; the start time separates a reused PID. None is secret and none
+// needs to be: this detects a contract violation, it does not defend against
+// one.
+var (
+	processIdentityOnce  sync.Once
+	processIdentityValue processWriter
+)
+
+func processIdentity() processWriter {
+	processIdentityOnce.Do(func() {
+		processIdentityValue = processWriter{
+			PID:       os.Getpid(),
+			StartedAt: time.Now(),
+		}
+		if bootID, err := ReadBootID(); err == nil {
+			processIdentityValue.BootID = bootID
+		} else if suffix, randErr := randomSuffix(); randErr == nil {
+			// No kernel boot id, which means this is not a Linux node. A
+			// random value keeps two processes distinguishable, which is all
+			// the detection needs; it merely loses the ability to tell a
+			// restart within one boot from a restart across boots.
+			processIdentityValue.BootID = "nonlinux-" + suffix
+		}
+	})
+	return processIdentityValue
+}
+
+type processWriter struct {
+	BootID    string
+	PID       int
+	StartedAt time.Time
+}
+
+// id renders the identity into the opaque string stored in the document.
+func (w processWriter) id() string {
+	return fmt.Sprintf("%s/%d/%d", w.BootID, w.PID, w.StartedAt.UnixNano())
+}
+
+func processWriterID() string { return processIdentity().id() }
+
 // config is the resolved option set. It is unexported: callers configure a
 // Store through Option values, which keeps the defaults in one place and
 // lets new settings be added without breaking anyone.
@@ -265,7 +315,6 @@ type config struct {
 	quarantineRetention int
 	quarantineMaxAge    time.Duration
 	orphanGrace         time.Duration
-	strictOwnership     bool
 	writerID            string
 }
 
@@ -417,23 +466,10 @@ func WithMaxPreservedBytes(n int) Option {
 	}
 }
 
-// WithStrictOwnership makes Store.Update fail with ErrForeignWrite when the
-// file was last written by another writer, instead of proceeding.
+// WithWriterID overrides the identifier stamped into Document.WriterID.
 //
-// The default is to proceed, because for an agent whose job is to fence a
-// node, refusing to record state is worse than recording it over someone
-// else's. Turn this on where a lost record is worse than a stalled agent —
-// in a test, or in a tool that audits the directory.
-func WithStrictOwnership(strict bool) Option {
-	return func(c *config) error {
-		c.strictOwnership = strict
-		return nil
-	}
-}
-
-// WithWriterID overrides the identifier stamped into Document.WriterID. The
-// default is random per Store, which is what makes a foreign write
-// detectable. Set it to something stable only if you have a reason.
+// The default identifies the process, not this Store, and is almost always
+// what you want. Override it in a test that needs a predictable value.
 func WithWriterID(id string) Option {
 	return func(c *config) error {
 		if id == "" {
@@ -479,11 +515,7 @@ func New(self Component, opts ...Option) (*Store, error) {
 
 	writerID := cfg.writerID
 	if writerID == "" {
-		id, err := randomSuffix()
-		if err != nil {
-			return nil, fmt.Errorf("nodestate: New: generating a writer id: %w", err)
-		}
-		writerID = id
+		writerID = processWriterID()
 	}
 
 	return &Store{
@@ -500,7 +532,6 @@ func New(self Component, opts ...Option) (*Store, error) {
 		quarantineRetention: cfg.quarantineRetention,
 		quarantineMaxAge:    cfg.quarantineMaxAge,
 		orphanGrace:         cfg.orphanGrace,
-		strictOwnership:     cfg.strictOwnership,
 		writerID:            writerID,
 	}, nil
 }
@@ -604,12 +635,17 @@ func (s *Store) ensureDirectory() error {
 // Quarantining is a write, and a Store only writes its own file. A peer's
 // damaged file is never touched — see ReadPeer.
 //
-// Load also reports a foreign write. Document.WriterID identifies the Store
-// instance that last wrote the file; finding another one means a second
-// process is writing a file this one owns, which the single-writer contract
-// forbids. The default is to report it in LoadResult.ForeignWrite and carry
-// on, because stalling a fencing agent is worse than overwriting a record
-// that should not exist. WithStrictOwnership inverts that.
+// Load also reports a foreign write. Document.WriterID identifies the
+// process that last wrote the file — boot id, process id and start time —
+// so finding another one means a second process is writing a file this one
+// owns, which the single-writer contract forbids.
+//
+// It is reported in LoadResult.ForeignWrite and nothing else happens. The
+// library never refuses to write on the strength of it: stalling a fencing
+// agent is worse than overwriting a record that should not exist, and a
+// refusal at start-up would let a predecessor stuck in uninterruptible sleep
+// keep its replacement from ever starting. Raise a condition on it; do not
+// gate anything on it.
 func (s *Store) Load(ctx context.Context) (*LoadResult, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
@@ -907,8 +943,13 @@ func (s *Store) WriteTo(ctx context.Context, c Component, doc *Document) error {
 }
 
 func (s *Store) writeLocked(doc *Document) error {
+	identity := processIdentity()
 	doc.SchemaVersion = Schema
 	doc.Agent.Component = s.self
+	doc.Agent.PID = identity.PID
+	if doc.Agent.StartedAt.IsZero() {
+		doc.Agent.StartedAt = identity.StartedAt
+	}
 	doc.UpdatedAt = s.clock.Now()
 	doc.WriterID = s.writerID
 	doc.Revision = s.nextRevision(doc.Revision)
@@ -1017,11 +1058,6 @@ func (s *Store) Update(ctx context.Context, mutate func(*Document) error) (*Docu
 	if err != nil {
 		return nil, err
 	}
-	if res.ForeignWrite && s.strictOwnership {
-		return nil, fmt.Errorf("%w: %s was last written by %q at revision %d",
-			ErrForeignWrite, s.Path(s.self), res.Document.WriterID, res.Document.Revision)
-	}
-
 	doc := res.Document
 	if err := mutate(doc); err != nil {
 		if errors.Is(err, ErrNoChange) {
