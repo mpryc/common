@@ -41,7 +41,11 @@ test: ## Run unit tests.
 	go test ./... -coverprofile cover.out -v
 
 .PHONY: lint
-lint: tidy goimports fix-imports vet verify-no-changes ## Run linters etc.
+lint: tidy goimports fix-imports vet verify-nodestate-deps verify-no-changes ## Run linters etc.
+
+.PHONY: verify-nodestate-deps
+verify-nodestate-deps: ## Verify pkg/nodestate imports only the standard library.
+	./hack/verify-nodestate-deps.sh
 
 .PHONY: check
 check: ## Dockerized version of make test with additional verifications
