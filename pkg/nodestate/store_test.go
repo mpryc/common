@@ -15,16 +15,26 @@ import (
 	"github.com/medik8s/common/pkg/nodestate/nodestatetest"
 )
 
-// tempStateDir returns a private temporary directory. t.TempDir's mode
-// depends on the umask and on the Go release, and the library requires a
-// directory no other user can act on, so the mode is set explicitly.
+// tempStateDir returns a private temporary directory suitable as a state
+// directory.
+//
+// Two adjustments. The mode is set explicitly because t.TempDir's depends on
+// the umask and on the Go release, and the library requires a directory no
+// other user can act on. The path is resolved because the library refuses a
+// state directory reached through a symlink, and a temporary directory is
+// one on some platforms — macOS puts them under /var, which is a link to
+// /private/var. A consumer writing its own tests will need the same.
 func tempStateDir(t *testing.T) string {
 	t.Helper()
 	dir := t.TempDir()
 	if err := os.Chmod(dir, 0o700); err != nil {
 		t.Fatalf("chmod %s: %v", dir, err)
 	}
-	return dir
+	resolved, err := filepath.EvalSymlinks(dir)
+	if err != nil {
+		t.Fatalf("resolve %s: %v", dir, err)
+	}
+	return resolved
 }
 
 func newStore(t *testing.T, self nodestate.Component, opts ...nodestate.Option) (*nodestate.Store, string) {

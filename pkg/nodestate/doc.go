@@ -173,6 +173,19 @@
 // post-mortem, and returns a fresh Document with StatusRecovered. The caller
 // keeps working; what it must do is notice, because its history is gone.
 //
+// The state directory is refused if its path reaches it through a symbolic
+// link at any level, not only at the last component. That closes the case
+// where an installer or an operator has redirected /var/lib/medik8s and
+// every per-file check still passes because the leaf really is a regular
+// root-owned file in a private directory. It is not a defence against a
+// race — an attacker who can create directories under /var/lib can swap a
+// component after the check — and closing that would mean holding a
+// directory descriptor and working through openat, which defends against
+// someone who already has privileged write access to the node. Set
+// SecurityPolicy.AllowSymlinks where a deployment redirects the path on
+// purpose; note that tests on macOS need it, or a resolved path, because
+// temporary directories there sit under /var.
+//
 // A host-path fault is yours to report, not to act on. If the directory
 // cannot be created, has permissions that make its contents untrustworthy, or
 // cannot be written, the operation returns a *PathError wrapping one of the

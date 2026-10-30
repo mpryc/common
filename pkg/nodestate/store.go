@@ -575,6 +575,9 @@ func (s *Store) ensureDirectory() error {
 	fi, err := s.fs.Lstat(s.dir)
 	switch {
 	case err == nil:
+		if err := s.checkResolvedPath(); err != nil {
+			return err
+		}
 		return s.security.checkDirectory(s.dir, fi)
 	case !errors.Is(err, fs.ErrNotExist):
 		return pathErrorf("lstat", s.dir, err)
@@ -593,6 +596,9 @@ func (s *Store) ensureDirectory() error {
 	fi, err = s.fs.Lstat(s.dir)
 	if err != nil {
 		return pathErrorf("lstat", s.dir, err)
+	}
+	if err := s.checkResolvedPath(); err != nil {
+		return err
 	}
 	if err := s.security.checkDirectory(s.dir, fi); err != nil {
 		return err
@@ -613,6 +619,43 @@ func (s *Store) ensureDirectory() error {
 		return pathErrorf("lstat", s.dir, err)
 	}
 	return s.security.checkDirectory(s.dir, fi)
+}
+
+// checkResolvedPath refuses a state directory reached through a symbolic
+// link at any point in its path.
+//
+// The per-file protections elsewhere — Lstat before open, O_NOFOLLOW, a
+// re-check on the descriptor — all guard the *final* component. None of them
+// notices a link one level up: with /var/lib/medik8s a link, every file this
+// package writes lands wherever that link points, and every check still
+// passes because the leaf really is a regular root-owned file in a 0700
+// directory.
+//
+// Comparing the configured path against its fully resolved form closes that
+// for the realistic case, which is a misconfiguration — an installer or an
+// operator who symlinked the host path — rather than an attack. It is not a
+// defence against a race: an attacker able to create directories under
+// /var/lib can swap a component after this check. Closing *that* needs a
+// directory file descriptor held open for the Store's lifetime with all work
+// done through openat, which is a much larger change and defends against an
+// attacker who, by definition, already has privileged write access to the
+// node. See the package documentation on what these controls are for.
+func (s *Store) checkResolvedPath() error {
+	if s.security.AllowSymlinks {
+		return nil
+	}
+	resolved, err := filepath.EvalSymlinks(s.dir)
+	if err != nil {
+		// Nothing to compare against. Any real problem with the path shows
+		// up in the Lstat and open checks that follow.
+		return nil
+	}
+	if resolved == s.dir {
+		return nil
+	}
+	return pathErrorf("verify", s.dir, fmt.Errorf(
+		"%w: the path resolves to %s, so a link somewhere above it is redirecting this directory",
+		ErrSymlink, resolved))
 }
 
 // Load reads this Store's own file and classifies what it found.

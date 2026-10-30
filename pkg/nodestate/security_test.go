@@ -319,3 +319,89 @@ func TestEnsureDirectory_IsIdempotent(t *testing.T) {
 		}
 	}
 }
+
+// TestIntermediateSymlinkIsRefused covers the gap the per-file protections
+// leave open.
+//
+// Lstat before open, O_NOFOLLOW, and the re-check on the descriptor all guard
+// the final component. None of them notices a link one level up: with
+// /var/lib/medik8s a link, every file this package writes lands wherever it
+// points, and every check still passes because the leaf really is a regular
+// root-owned file in a 0700 directory.
+func TestIntermediateSymlinkIsRefused(t *testing.T) {
+	t.Parallel()
+
+	root := tempStateDir(t)
+	elsewhere := filepath.Join(root, "elsewhere")
+	if err := os.MkdirAll(filepath.Join(elsewhere, "state"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(elsewhere, filepath.Join(root, "medik8s")); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+	dir := filepath.Join(root, "medik8s", "state")
+
+	s, err := nodestate.New(nodestate.ComponentSBR, nodestate.WithDir(dir))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err := s.EnsureDirectory(context.Background()); !errors.Is(err, nodestate.ErrSymlink) {
+		t.Fatalf("EnsureDirectory error = %v, want ErrSymlink", err)
+	}
+
+	err = s.Write(context.Background(), nodestate.NewDocument(nodestate.ComponentSBR))
+	if !errors.Is(err, nodestate.ErrSymlink) {
+		t.Fatalf("Write error = %v, want ErrSymlink", err)
+	}
+	if _, statErr := os.Stat(filepath.Join(elsewhere, "state", nodestate.SBRFile)); statErr == nil {
+		t.Error("the document landed at the symlink target")
+	}
+}
+
+func TestIntermediateSymlinkCanBeAllowed(t *testing.T) {
+	t.Parallel()
+
+	root := tempStateDir(t)
+	elsewhere := filepath.Join(root, "elsewhere")
+	if err := os.MkdirAll(filepath.Join(elsewhere, "state"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(elsewhere, filepath.Join(root, "medik8s")); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+
+	policy := nodestate.DefaultSecurityPolicy()
+	policy.AllowSymlinks = true
+	s, err := nodestate.New(nodestate.ComponentSBR,
+		nodestate.WithDir(filepath.Join(root, "medik8s", "state")),
+		nodestate.WithSecurityPolicy(policy))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err := s.Write(context.Background(), nodestate.NewDocument(nodestate.ComponentSBR)); err != nil {
+		t.Fatalf("Write with AllowSymlinks: %v", err)
+	}
+}
+
+// TestResolvedPathCheckAcceptsAnOrdinaryDirectory guards against the check
+// refusing every deployment, which is the way this sort of guard usually
+// fails.
+func TestResolvedPathCheckAcceptsAnOrdinaryDirectory(t *testing.T) {
+	t.Parallel()
+
+	s, _ := newStore(t, nodestate.ComponentSBR)
+	if err := s.EnsureDirectory(context.Background()); err != nil {
+		t.Fatalf("EnsureDirectory on a plain directory: %v", err)
+	}
+	// Including a directory this call has to create itself.
+	nested, err := nodestate.New(nodestate.ComponentSBR,
+		nodestate.WithDir(filepath.Join(s.Directory(), "a", "b", "state")))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := nested.EnsureDirectory(context.Background()); err != nil {
+		t.Fatalf("EnsureDirectory on a path it created: %v", err)
+	}
+}

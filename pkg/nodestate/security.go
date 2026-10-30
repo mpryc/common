@@ -37,9 +37,15 @@ type SecurityPolicy struct {
 	// running as anyone.
 	AllowedUIDs []int
 
-	// AllowSymlinks disables the symlink refusal. It exists for the rare
-	// deployment that genuinely redirects the state directory. Setting it
-	// gives up the guarantee that a write cannot be aimed at another file.
+	// AllowSymlinks disables both symlink refusals: the state directory and
+	// the files in it may be links, and the directory's path may reach it
+	// through one.
+	//
+	// It exists for the rare deployment that genuinely redirects the state
+	// directory, and for tests on a platform whose temporary directories sit
+	// under a link — macOS puts them under /var, which resolves to
+	// /private/var. Setting it gives up the guarantee that a write cannot be
+	// aimed at another file.
 	AllowSymlinks bool
 }
 
