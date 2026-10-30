@@ -148,6 +148,15 @@
 // Whenever either bound drops a record, Document.RebootHistoryCompleteSince
 // moves rather than the history pretending to still be whole.
 //
+// Store.CheckDurableStorage is the other half, and it is about where the
+// directory is rather than what is in it. If the host path was never mounted
+// — forgotten, misspelled, or an emptyDir used by mistake — the agent writes
+// happily into the container's own layer or into memory. Nothing errors, and
+// the state resets on every pod replacement, so the reboot budget never
+// accumulates and the brake never applies. Call it once at start-up; it is
+// deliberately not wired into Write, because whether to run degraded on
+// non-durable storage is the consumer's decision.
+//
 // Store.Cleanup reclaims what is left in the directory rather than in the
 // document: temporary files abandoned by a process that was killed mid-write,
 // and quarantined copies past their count or age. It runs once per Store on

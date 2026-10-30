@@ -83,6 +83,13 @@ var (
 	// carries on rather than refusing.
 	ErrForeignWrite = errors.New("nodestate: state file was modified by another writer")
 
+	// ErrNotDurable means the state directory is on a filesystem that cannot
+	// hold state across a pod replacement or a reboot — the container's own
+	// writable layer, or memory. It almost always means a host path volume
+	// was not mounted where it was supposed to be. See
+	// Store.CheckDurableStorage.
+	ErrNotDurable = errors.New("nodestate: state directory is not durable storage")
+
 	// ErrBootIDUnavailable means the kernel boot identifier could not be read
 	// or did not look like one.
 	ErrBootIDUnavailable = errors.New("nodestate: boot id unavailable")

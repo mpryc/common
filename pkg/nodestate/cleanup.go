@@ -166,3 +166,48 @@ func (s *Store) sweep() (*CleanupReport, error) {
 // file it writes for base. The leading dot keeps it out of a casual listing
 // and, more usefully, out of the quarantine prefix's way.
 func temporaryPrefix(base string) string { return "." + base + ".tmp-" }
+
+// CheckDurableStorage reports whether the state directory is on a filesystem
+// that can hold state across the things it has to survive.
+//
+// The failure it catches is a deployment mistake with no symptom. If the
+// host path is not mounted — forgotten, misspelled, or an emptyDir used by
+// accident — the agent writes happily into the container's own layer or into
+// memory. Nothing errors. Every write succeeds, every read succeeds, and the
+// state silently resets on every pod replacement or every reboot, so the
+// reboot budget never accumulates and the brake it exists to apply never
+// applies. An agent could run that way for months.
+//
+// Call it once at start-up and treat a failure as a configuration error
+// worth refusing to proceed on, or at least worth a loud condition. It is
+// deliberately not wired into Write: whether a node without durable state
+// should run degraded or not start at all is the consumer's decision, not
+// this library's.
+//
+// A consumer with readOnlyRootFilesystem set is already protected against
+// the worst version of this, because a missing mount fails loudly with
+// EROFS instead of landing in the container layer. The check still catches
+// tmpfs and an emptyDir mounted on purpose.
+//
+// It reports nil on a platform without statfs, and on any filesystem it does
+// not recognise as unsuitable — it is a check for known-bad, not a warranty
+// of known-good.
+func (s *Store) CheckDurableStorage(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+
+	magic, err := filesystemType(s.dir)
+	if err != nil {
+		// Either the platform does not report it or the directory is not
+		// there yet. Neither is evidence of a problem with the storage, and
+		// EnsureDirectory is the call that reports a missing directory.
+		return nil
+	}
+	name, reason := describeFilesystem(magic)
+	if name == "" {
+		return nil
+	}
+	return pathErrorf("verify", s.dir, fmt.Errorf(
+		"%w: the state directory is on %s, and %s", ErrNotDurable, name, reason))
+}
