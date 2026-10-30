@@ -820,17 +820,132 @@ func (s *Store) newDocument() *Document {
 // occasionally what a diagnostic tool wants; it is not what an agent wants at
 // start-up, which is Load.
 func (s *Store) ReadPeer(ctx context.Context, c Component) (*Document, error) {
+	res, err := s.LoadPeer(ctx, c)
+	if err != nil {
+		return nil, err
+	}
+	return res.Document, nil
+}
+
+// PeerStatus says why a peer's document is or is not available.
+type PeerStatus int
+
+const (
+	// PeerOK means the document was read.
+	PeerOK PeerStatus = iota
+	// PeerAbsent means there is no file. The peer has not run on this node,
+	// or has not written yet. This is the ordinary case on a node where only
+	// one agent is deployed, and is not worth reporting.
+	PeerAbsent
+	// PeerUnusable means the file exists but its contents could not be used:
+	// empty, truncated, not a document, or claiming another owner. That is
+	// the peer's own bookkeeping problem and it will recover from it; the
+	// only cost here is that its history is missing from any merge.
+	PeerUnusable
+	// PeerUnreadable means the file is there and this process could not get
+	// at it: permission denied, an owner or mode the security policy
+	// rejects, a symlink, or a size over the read limit.
+	//
+	// This is the one status that is not the peer's problem. It is a
+	// deployment fault on this node — an agent not running as the owning
+	// user, a user namespace mapping, an SELinux denial — and it silently
+	// removes that peer's reboots from every budget merged here. See
+	// PeerRead.Configured.
+	PeerUnreadable
+	// PeerUnsupportedSchema means the file declares a schema version outside
+	// the range this build understands, which during a staggered upgrade
+	// means the peer is newer. Its reboots are missing from every budget
+	// until this side is upgraded too.
+	PeerUnsupportedSchema
+)
+
+// String implements fmt.Stringer.
+func (p PeerStatus) String() string {
+	switch p {
+	case PeerOK:
+		return "OK"
+	case PeerAbsent:
+		return "Absent"
+	case PeerUnusable:
+		return "Unusable"
+	case PeerUnreadable:
+		return "Unreadable"
+	case PeerUnsupportedSchema:
+		return "UnsupportedSchema"
+	default:
+		return fmt.Sprintf("PeerStatus(%d)", int(p))
+	}
+}
+
+// PeerRead is what LoadPeer returns.
+type PeerRead struct {
+	// Document is the peer's state, or nil when there is nothing usable.
+	Document *Document
+	// Status says which of those it is.
+	Status PeerStatus
+	// Cause is the underlying error for every status but PeerOK and
+	// PeerAbsent.
+	Cause error
+}
+
+// Configured reports whether the peer's absence is this node's problem rather
+// than the peer's.
+//
+// It is true for PeerUnreadable: the file is there and this process may not
+// read it. That is a deployment fault — an agent not running as the owning
+// user, a user namespace mapping, an SELinux denial — and it is worth a
+// condition, because every reboot budget merged on this node is quietly
+// missing that peer's history until it is fixed.
+func (r *PeerRead) Configured() bool {
+	return r != nil && r.Status == PeerUnreadable
+}
+
+// LoadPeer reads another component's file and says why, when it cannot.
+//
+// ReadPeer deliberately flattens every failure to nil, which is right for
+// liveness and wrong for diagnosis: "the peer has never run" and "the file is
+// there and I am not allowed to read it" produce the same answer, and the
+// second silently removes that peer's reboots from every budget on the node.
+// Use this where the distinction matters, and raise a condition on
+// PeerRead.Configured.
+//
+// Like ReadPeer it returns an error only for a programming mistake — an
+// invalid component name — or a cancelled context. It never writes.
+func (s *Store) LoadPeer(ctx context.Context, c Component) (*PeerRead, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
 	if err := c.Validate(); err != nil {
 		return nil, err
 	}
+
 	doc, err := s.readDocument(s.Path(c), c)
-	if err != nil {
-		return nil, nil
+	switch {
+	case err == nil:
+		return &PeerRead{Document: doc, Status: PeerOK}, nil
+	case errors.Is(err, fs.ErrNotExist):
+		return &PeerRead{Status: PeerAbsent}, nil
+	case errors.Is(err, ErrSchemaUnsupported):
+		return &PeerRead{Status: PeerUnsupportedSchema, Cause: err}, nil
+	case isAccessFault(err):
+		return &PeerRead{Status: PeerUnreadable, Cause: err}, nil
+	default:
+		return &PeerRead{Status: PeerUnusable, Cause: err}, nil
 	}
-	return doc, nil
+}
+
+// isAccessFault reports whether err means this process could not get at the
+// file, as opposed to the file's contents being unusable.
+//
+// The distinction is the whole point of PeerUnreadable: the first is a
+// deployment problem on this node and the second is the peer's own business.
+func isAccessFault(err error) bool {
+	return errors.Is(err, fs.ErrPermission) ||
+		errors.Is(err, ErrInsecurePermissions) ||
+		errors.Is(err, ErrInsecureOwner) ||
+		errors.Is(err, ErrSymlink) ||
+		errors.Is(err, ErrNotRegular) ||
+		errors.Is(err, ErrTooLarge)
 }
 
 // ReadAll reads several components' files and returns the ones that could be
@@ -846,7 +961,10 @@ func (s *Store) ReadPeer(ctx context.Context, c Component) (*Document, error) {
 //
 // An unreadable file is simply absent from the result. There is no error
 // return by design: every failure mode here is one the caller must carry on
-// through.
+// through. Use LoadPeer when you need to know *why* a peer is missing — in
+// particular to tell "has never run" from "is there and I may not read it",
+// which is a deployment fault that silently drops that peer's history out of
+// every budget merged here.
 func (s *Store) ReadAll(ctx context.Context, components ...Component) map[Component]*Document {
 	out := make(map[Component]*Document, len(components))
 	if ctx.Err() != nil {

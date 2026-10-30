@@ -157,8 +157,16 @@
 // that treats them alike will get one of them wrong.
 //
 // A peer's problem is never yours. ReadPeer returns (nil, nil) for an absent,
-// empty, truncated, oversized, symlinked, wrongly-owned or
-// future-schema peer file. There is no error to handle, by design.
+// empty, truncated, oversized, symlinked, wrongly-owned or future-schema
+// peer file. There is no error to handle, by design.
+//
+// One of those is not the peer's problem, though. A file that is there and
+// cannot be read — permission denied, an owner the policy rejects, an
+// SELinux denial — is a deployment fault on this node, and flattening it to
+// "the peer has never run" hides something that will not fix itself and that
+// quietly removes that peer's reboots from every budget merged here. Use
+// LoadPeer where the distinction matters and raise a condition on
+// PeerRead.Configured.
 //
 // Your own file repairs itself. Load quarantines an unusable file, preserving
 // its bytes under a *.corrupt name so the shape of the damage survives for a
