@@ -162,7 +162,8 @@ func ExampleMergeReboots() {
 	fmt.Println("requested:", requested, "autonomous:", autonomous)
 
 	// A count is only an answer if the history covers the window it is taken
-	// over. Always ask.
+	// over. Always ask — and against a live store, ask Snapshot rather than
+	// these primitives, because they cannot see a file that failed to read.
 	fmt.Println("history covers the window:", nodestate.RebootHistoryComplete(window, snr, sbr))
 
 	// Output:

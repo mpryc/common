@@ -100,22 +100,32 @@
 //	    return nil
 //	})
 //
-// Count across both files, so that one remediation counts once however it was
-// carried out — and check that the history actually covers the window before
-// treating the count as an answer:
+// Count across both files, so that one remediation counts once however it
+// was carried out, and check that the history actually covers the window
+// before treating the count as an answer:
 //
-//	docs := store.ReadAll(ctx)
-//	sbr, snr := docs[nodestate.ComponentSBR], docs[nodestate.ComponentSNR]
+//	snap := store.Snapshot(ctx)
 //
-//	autonomous := nodestate.CountReboots(windowStart,
-//	    func(r nodestate.RebootEntry) bool { return r.Remediation == nil }, sbr, snr)
+//	autonomous := snap.CountReboots(windowStart,
+//	    func(r nodestate.RebootEntry) bool { return r.Remediation == nil })
 //
-//	if !nodestate.RebootHistoryComplete(windowStart, sbr, snr) {
-//	    // Records from inside the window were aged out or dropped. The count
-//	    // is a lower bound, so fail toward counting: a reboot loop is the
+//	if !snap.HistoryComplete(windowStart) {
+//	    // Records from inside the window are missing: aged out, dropped by
+//	    // the ceiling, or in a file this process could not read. The count
+//	    // is a lower bound, so fail toward counting — a reboot loop is the
 //	    // case the budget exists for, and it is the case that produces the
 //	    // most records.
+//	    //
+//	    // snap.Missing() names the components that could not be read, and
+//	    // PeerRead.Configured says which of those are this node's fault.
 //	}
+//
+// Use Snapshot rather than composing ReadAll with MergeReboots and
+// RebootHistoryComplete. The primitives are still there and still correct,
+// but they cannot see what ReadAll dropped: a peer file this process may not
+// read disappears from the merge, and RebootHistoryComplete, handed only
+// what survived, reports the history as whole. The count then comes out low
+// and confident, which is the worst shape a budget error can take.
 //
 // # Bounding the file
 //
