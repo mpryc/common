@@ -35,7 +35,7 @@ func plantOrphan(t *testing.T, dir string, owner nodestate.Component, age time.D
 func TestCleanup_ReclaimsOrphanedTemporaryFiles(t *testing.T) {
 	t.Parallel()
 
-	s, dir := newStore(t, nodestate.ComponentSBR, nodestate.WithOrphanGrace(time.Hour))
+	s, dir := newStore(t, nodestate.ComponentSBR, nodestate.WithHousekeeping(nodestate.HousekeepingPolicy{OrphanGrace: time.Hour}))
 	ctx := context.Background()
 
 	stale := plantOrphan(t, dir, nodestate.ComponentSBR, 25*time.Hour)
@@ -64,7 +64,7 @@ func TestCleanup_ReclaimsOrphanedTemporaryFiles(t *testing.T) {
 func TestCleanup_LeavesAWriteThatMayStillBeInFlight(t *testing.T) {
 	t.Parallel()
 
-	s, dir := newStore(t, nodestate.ComponentSBR, nodestate.WithOrphanGrace(time.Hour))
+	s, dir := newStore(t, nodestate.ComponentSBR, nodestate.WithHousekeeping(nodestate.HousekeepingPolicy{OrphanGrace: time.Hour}))
 
 	fresh := plantOrphan(t, dir, nodestate.ComponentSBR, time.Minute)
 
@@ -86,7 +86,7 @@ func TestCleanup_LeavesAWriteThatMayStillBeInFlight(t *testing.T) {
 func TestCleanup_NeverTouchesAPeersFiles(t *testing.T) {
 	t.Parallel()
 
-	s, dir := newStore(t, nodestate.ComponentSBR, nodestate.WithOrphanGrace(time.Minute))
+	s, dir := newStore(t, nodestate.ComponentSBR, nodestate.WithHousekeeping(nodestate.HousekeepingPolicy{OrphanGrace: time.Minute}))
 
 	peerOrphan := plantOrphan(t, dir, nodestate.ComponentSNR, 48*time.Hour)
 	peerQuarantine := filepath.Join(dir, nodestate.SNRFile+".20200101T000000.000000000Z-aaaaaaaa.corrupt")
@@ -116,7 +116,7 @@ func TestCleanup_NeverTouchesAPeersFiles(t *testing.T) {
 func TestFirstWriteSweepsWithoutBeingAsked(t *testing.T) {
 	t.Parallel()
 
-	s, dir := newStore(t, nodestate.ComponentSBR, nodestate.WithOrphanGrace(time.Minute))
+	s, dir := newStore(t, nodestate.ComponentSBR, nodestate.WithHousekeeping(nodestate.HousekeepingPolicy{OrphanGrace: time.Minute}))
 	orphan := plantOrphan(t, dir, nodestate.ComponentSBR, time.Hour)
 
 	if err := s.Write(context.Background(), nodestate.NewDocument(nodestate.ComponentSBR)); err != nil {
@@ -158,8 +158,10 @@ func TestCleanup_ExpiresOldQuarantineFiles(t *testing.T) {
 	t.Parallel()
 
 	s, dir := newStore(t, nodestate.ComponentSBR,
-		nodestate.WithQuarantineRetention(5),
-		nodestate.WithQuarantineMaxAge(7*24*time.Hour))
+		nodestate.WithHousekeeping(nodestate.HousekeepingPolicy{
+			QuarantineRetention: 5,
+			QuarantineMaxAge:    7 * 24 * time.Hour,
+		}))
 
 	recent := filepath.Join(dir, nodestate.SBRFile+".20240101T000000.000000000Z-bbbbbbbb.corrupt")
 	ancient := filepath.Join(dir, nodestate.SBRFile+".20200101T000000.000000000Z-aaaaaaaa.corrupt")
@@ -228,7 +230,7 @@ func TestHousekeepingNeverEndangersTheLiveDocument(t *testing.T) {
 
 	rec := nodestatetest.NewRecordingFS(nodestate.OSFileSystem())
 	s, dir := newStore(t, nodestate.ComponentSBR,
-		nodestate.WithFileSystem(rec), nodestate.WithOrphanGrace(time.Minute))
+		nodestate.WithFileSystem(rec), nodestate.WithHousekeeping(nodestate.HousekeepingPolicy{OrphanGrace: time.Minute}))
 	ctx := context.Background()
 
 	doc := nodestate.NewDocument(nodestate.ComponentSBR)
@@ -275,7 +277,7 @@ func TestHousekeepingNeverEndangersTheLiveDocument(t *testing.T) {
 func TestPreservedMembersAreCapped(t *testing.T) {
 	t.Parallel()
 
-	s, dir := newStore(t, nodestate.ComponentSBR, nodestate.WithMaxPreservedBytes(4<<10))
+	s, dir := newStore(t, nodestate.ComponentSBR, nodestate.WithHousekeeping(nodestate.HousekeepingPolicy{MaxPreservedBytes: 4 << 10}))
 	ctx := context.Background()
 
 	raw := map[string]interface{}{
@@ -330,7 +332,7 @@ func TestPreservedMembersAreCapped(t *testing.T) {
 func TestPreservedMembersUnderTheCapAreKept(t *testing.T) {
 	t.Parallel()
 
-	s, dir := newStore(t, nodestate.ComponentSBR, nodestate.WithMaxPreservedBytes(4<<10))
+	s, dir := newStore(t, nodestate.ComponentSBR, nodestate.WithHousekeeping(nodestate.HousekeepingPolicy{MaxPreservedBytes: 4 << 10}))
 
 	mustWrite(t, filepath.Join(dir, nodestate.SBRFile),
 		`{"schemaVersion":1,"node":"worker-0","agent":{"component":"sbr"},"futureKey":{"a":1}}`)
@@ -352,7 +354,7 @@ func TestPreservedMembersUnderTheCapAreKept(t *testing.T) {
 func TestPreservedMembersCapCountsEveryLevel(t *testing.T) {
 	t.Parallel()
 
-	s, dir := newStore(t, nodestate.ComponentSBR, nodestate.WithMaxPreservedBytes(2<<10))
+	s, dir := newStore(t, nodestate.ComponentSBR, nodestate.WithHousekeeping(nodestate.HousekeepingPolicy{MaxPreservedBytes: 2 << 10}))
 
 	// The ballast is spread across nested entries rather than the top level,
 	// which a cap that only looked at Document.Unknown would miss.

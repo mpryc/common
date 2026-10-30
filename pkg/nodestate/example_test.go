@@ -181,14 +181,17 @@ func ExampleStore_Cleanup() {
 	defer func() { _ = os.RemoveAll(dir) }()
 
 	ctx := context.Background()
-	store, _ := nodestate.New(nodestate.ComponentSBR,
-		nodestate.WithDir(dir),
-		// A live agent leaves this at the default hour: a write still in
-		// flight must never be mistaken for an abandoned one.
-		nodestate.WithOrphanGrace(0))
+	// The grace period is left at its default hour, as a live agent must
+	// leave it: a write still in flight must never be mistaken for an
+	// abandoned one.
+	store, _ := nodestate.New(nodestate.ComponentSBR, nodestate.WithDir(dir))
 
-	// Stand in for what a killed process leaves behind.
-	_ = os.WriteFile(filepath.Join(dir, ".sbr.json.tmp-0123456789abcdef"), []byte(`{"schemaVer`), 0o600)
+	// Stand in for what a process killed mid-write leaves behind, with a
+	// modification time old enough to be unambiguous.
+	orphan := filepath.Join(dir, ".sbr.json.tmp-0123456789abcdef")
+	_ = os.WriteFile(orphan, []byte(`{"schemaVer`), 0o600)
+	yesterday := time.Now().Add(-24 * time.Hour)
+	_ = os.Chtimes(orphan, yesterday, yesterday)
 
 	report, err := store.Cleanup(ctx)
 	if err != nil {

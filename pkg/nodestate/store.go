@@ -5,12 +5,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"io/fs"
 	"os"
 	"path/filepath"
-	"sort"
-	"strings"
 	"sync"
 	"time"
 )
@@ -27,31 +24,6 @@ const (
 	// the cost of a hostile or runaway file; anything larger is treated as
 	// unreadable rather than parsed.
 	DefaultMaxReadBytes = 8 << 20 // 8 MiB
-
-	// DefaultQuarantineMaxAge is how long a quarantined copy is kept before
-	// it is reclaimed. Evidence of a fault nobody looked at in a month is no
-	// longer evidence; it is just a file on a node's root filesystem.
-	DefaultQuarantineMaxAge = 30 * 24 * time.Hour
-
-	// DefaultOrphanGrace is how long a temporary file must have gone
-	// untouched before a sweep treats it as abandoned rather than in flight.
-	// Generous on purpose: reclaiming a live write would be far worse than
-	// leaving a dead one in place for an hour.
-	DefaultOrphanGrace = time.Hour
-
-	// DefaultMaxPreservedBytes caps the total size of the members this build
-	// does not recognise but carries forward. Preservation exists so a newer
-	// peer's few extra fields survive a downgrade, not so the file can be
-	// used as storage: without a cap, anything able to write the directory
-	// could stuff it past DefaultMaxDocumentBytes and leave the agent unable
-	// to write its own state ever again.
-	DefaultMaxPreservedBytes = 64 << 10 // 64 KiB
-
-	// DefaultQuarantineRetention is how many quarantined copies of a file are
-	// kept. More than one is useful because a boot loop produces one per boot
-	// and the first is usually the informative one; keeping them all would let
-	// that loop fill the host path.
-	DefaultQuarantineRetention = 3
 
 	// quarantineSuffix terminates every quarantined file name, so operators
 	// and log scrapers can find them with one glob.
@@ -209,13 +181,10 @@ type Store struct {
 	retention RetentionPolicy
 	security  SecurityPolicy
 
-	maxDocumentBytes    int
-	maxReadBytes        int
-	maxPreservedBytes   int
-	quarantineRetention int
-	quarantineMaxAge    time.Duration
-	orphanGrace         time.Duration
-	writerID            string
+	maxDocumentBytes int
+	maxReadBytes     int
+	housekeeping     HousekeepingPolicy
+	writerID         string
 
 	// mu serialises read-modify-write cycles on this file. It is held across
 	// file I/O, which is why none of these operations is cancellable: see the
@@ -304,18 +273,15 @@ func processWriterID() string { return processIdentity().id() }
 // Store through Option values, which keeps the defaults in one place and
 // lets new settings be added without breaking anyone.
 type config struct {
-	dir                 string
-	fs                  FS
-	clock               Clock
-	retention           RetentionPolicy
-	security            SecurityPolicy
-	maxDocumentBytes    int
-	maxReadBytes        int
-	maxPreservedBytes   int
-	quarantineRetention int
-	quarantineMaxAge    time.Duration
-	orphanGrace         time.Duration
-	writerID            string
+	dir              string
+	fs               FS
+	clock            Clock
+	retention        RetentionPolicy
+	security         SecurityPolicy
+	maxDocumentBytes int
+	maxReadBytes     int
+	housekeeping     HousekeepingPolicy
+	writerID         string
 }
 
 // Option configures a Store. See the With functions in this package.
@@ -411,57 +377,19 @@ func WithMaxReadBytes(n int) Option {
 	}
 }
 
-// WithQuarantineRetention sets how many quarantined copies of the owned file
-// are kept. It must be at least one: the evidence in the first bad file is
-// usually the only record of what went wrong.
-func WithQuarantineRetention(n int) Option {
-	return func(c *config) error {
-		if n < 1 {
-			return fmt.Errorf("nodestate: WithQuarantineRetention: %d must be at least 1", n)
-		}
-		c.quarantineRetention = n
-		return nil
-	}
-}
-
-// WithQuarantineMaxAge sets how long a quarantined copy is kept. Zero means
-// forever, which leaves reclaiming them to the operator.
-func WithQuarantineMaxAge(d time.Duration) Option {
-	return func(c *config) error {
-		if d < 0 {
-			return fmt.Errorf("nodestate: WithQuarantineMaxAge: %s must not be negative", d)
-		}
-		c.quarantineMaxAge = d
-		return nil
-	}
-}
-
-// WithOrphanGrace sets how long a temporary file must have gone untouched
-// before a sweep reclaims it.
+// WithHousekeeping replaces the policy bounding what accumulates in the
+// state directory: how many quarantined copies are kept and for how long,
+// how long a temporary file must sit untouched before a sweep reclaims it,
+// and how much unrecognised data is carried forward from a newer peer.
 //
-// Lower it only where no other process can possibly be writing this
-// component's file, such as a test. Setting it too low on a live node risks
-// deleting a write that is merely slow, which on failing storage is the
-// normal case.
-func WithOrphanGrace(d time.Duration) Option {
+// Zero fields take their defaults, so adjusting one setting does not mean
+// restating the rest.
+func WithHousekeeping(policy HousekeepingPolicy) Option {
 	return func(c *config) error {
-		if d < 0 {
-			return fmt.Errorf("nodestate: WithOrphanGrace: %s must not be negative", d)
+		if err := policy.Validate(); err != nil {
+			return err
 		}
-		c.orphanGrace = d
-		return nil
-	}
-}
-
-// WithMaxPreservedBytes caps the total size of unrecognised members carried
-// forward from a newer peer. Beyond it they are dropped and the fact is
-// recorded as an EventReasonPreservedFieldsDropped event.
-func WithMaxPreservedBytes(n int) Option {
-	return func(c *config) error {
-		if n < 0 {
-			return fmt.Errorf("nodestate: WithMaxPreservedBytes: %d must not be negative", n)
-		}
-		c.maxPreservedBytes = n
+		c.housekeeping = policy.resolved()
 		return nil
 	}
 }
@@ -492,17 +420,14 @@ func New(self Component, opts ...Option) (*Store, error) {
 	}
 
 	cfg := config{
-		dir:                 Dir,
-		fs:                  OSFileSystem(),
-		clock:               SystemClock(),
-		retention:           DefaultRetention(),
-		security:            DefaultSecurityPolicy(),
-		maxDocumentBytes:    DefaultMaxDocumentBytes,
-		maxReadBytes:        DefaultMaxReadBytes,
-		maxPreservedBytes:   DefaultMaxPreservedBytes,
-		quarantineRetention: DefaultQuarantineRetention,
-		quarantineMaxAge:    DefaultQuarantineMaxAge,
-		orphanGrace:         DefaultOrphanGrace,
+		dir:              Dir,
+		fs:               OSFileSystem(),
+		clock:            SystemClock(),
+		retention:        DefaultRetention(),
+		security:         DefaultSecurityPolicy(),
+		maxDocumentBytes: DefaultMaxDocumentBytes,
+		maxReadBytes:     DefaultMaxReadBytes,
+		housekeeping:     DefaultHousekeeping().resolved(),
 	}
 	for i, opt := range opts {
 		if opt == nil {
@@ -519,20 +444,17 @@ func New(self Component, opts ...Option) (*Store, error) {
 	}
 
 	return &Store{
-		self:                self,
-		dir:                 cfg.dir,
-		mu:                  lockForPath(filepath.Join(cfg.dir, filepath.Base(self.FileName()))),
-		fs:                  cfg.fs,
-		clock:               cfg.clock,
-		retention:           cfg.retention,
-		security:            cfg.security,
-		maxDocumentBytes:    cfg.maxDocumentBytes,
-		maxReadBytes:        cfg.maxReadBytes,
-		maxPreservedBytes:   cfg.maxPreservedBytes,
-		quarantineRetention: cfg.quarantineRetention,
-		quarantineMaxAge:    cfg.quarantineMaxAge,
-		orphanGrace:         cfg.orphanGrace,
-		writerID:            writerID,
+		self:             self,
+		dir:              cfg.dir,
+		mu:               lockForPath(filepath.Join(cfg.dir, filepath.Base(self.FileName()))),
+		fs:               cfg.fs,
+		clock:            cfg.clock,
+		retention:        cfg.retention,
+		security:         cfg.security,
+		maxDocumentBytes: cfg.maxDocumentBytes,
+		maxReadBytes:     cfg.maxReadBytes,
+		housekeeping:     cfg.housekeeping,
+		writerID:         writerID,
 	}, nil
 }
 
@@ -812,11 +734,11 @@ func (s *Store) verifyDirectoryIfPresent() error {
 // All of them go, rather than an arbitrary subset, so the outcome does not
 // depend on map iteration order.
 func (s *Store) capPreserved(doc *Document) {
-	if s.maxPreservedBytes <= 0 {
+	if s.housekeeping.MaxPreservedBytes <= 0 {
 		return
 	}
 	total := doc.preservedBytes()
-	if total <= s.maxPreservedBytes {
+	if total <= s.housekeeping.MaxPreservedBytes {
 		return
 	}
 	doc.dropPreserved()
@@ -825,7 +747,7 @@ func (s *Store) capPreserved(doc *Document) {
 		Type:   "Warning",
 		Reason: EventReasonPreservedFieldsDropped,
 		Message: fmt.Sprintf("dropped %d bytes of members written by a newer peer, over the %d byte limit; "+
-			"a staggered upgrade will not carry that peer's data through this agent", total, s.maxPreservedBytes),
+			"a staggered upgrade will not carry that peer's data through this agent", total, s.housekeeping.MaxPreservedBytes),
 	})
 }
 
@@ -1238,340 +1160,3 @@ func (s *Store) Update(ctx context.Context, mutate func(*Document) error) (*Docu
 	}
 	return doc, nil
 }
-
-// --- reading ---
-
-// readDocument reads and validates one state file. Every failure it can
-// return is classifiable with errors.Is: fs.ErrNotExist, ErrSymlink,
-// ErrNotRegular, ErrInsecurePermissions, ErrInsecureOwner, ErrTooLarge,
-// ErrCorrupt or ErrSchemaUnsupported.
-func (s *Store) readDocument(path string, owner Component) (*Document, error) {
-	stat := s.fs.Lstat
-	fromLstat := true
-	if s.security.AllowSymlinks {
-		stat, fromLstat = s.fs.Stat, false
-	}
-
-	fi, err := stat(path)
-	if err != nil {
-		if errors.Is(err, fs.ErrNotExist) {
-			return nil, err // caller distinguishes absence from damage
-		}
-		return nil, pathErrorf("stat", path, err)
-	}
-	if err := s.security.checkFile(path, fi, fromLstat); err != nil {
-		return nil, err
-	}
-	if fi.Size() > int64(s.maxReadBytes) {
-		return nil, pathErrorf("read", path,
-			fmt.Errorf("%w: %d bytes, over the %d byte read limit", ErrTooLarge, fi.Size(), s.maxReadBytes))
-	}
-
-	f, err := s.fs.Open(path, OpenOptions{FollowSymlinks: s.security.AllowSymlinks})
-	if err != nil {
-		if errors.Is(err, fs.ErrNotExist) {
-			return nil, err
-		}
-		// A refusal to open is most often O_NOFOLLOW rejecting a link that
-		// appeared between the stat and the open. Report it as such rather
-		// than as a generic I/O error: it is the TOCTOU case the flag exists
-		// for, and a caller seeing it should look at who else writes here.
-		if isSymlinkOpenRefusal(err) {
-			return nil, pathErrorf("open", path, fmt.Errorf("%w: it was replaced by a link after it was checked", ErrSymlink))
-		}
-		return nil, pathErrorf("open", path, err)
-	}
-	defer func() { _ = f.Close() }()
-
-	// Re-check on the descriptor. Everything learned from the path above
-	// describes whatever was there a moment ago; this describes what is
-	// actually open.
-	opened, err := f.Stat()
-	if err != nil {
-		return nil, pathErrorf("fstat", path, err)
-	}
-	if err := s.security.checkFile(path, opened, false); err != nil {
-		return nil, err
-	}
-
-	// The size check above used what stat reported; this one uses what was
-	// actually there. A file that grows in between is refused, not truncated.
-	data, err := readAtMost(f, s.maxReadBytes)
-	if err != nil {
-		return nil, pathErrorf("read", path, err)
-	}
-
-	return parseDocument(path, data, owner)
-}
-
-// readAtMost reads up to limit bytes and reports ErrTooLarge if there are
-// more, rather than silently truncating or allocating without bound.
-func readAtMost(r io.Reader, limit int) ([]byte, error) {
-	data, err := io.ReadAll(io.LimitReader(r, int64(limit)+1))
-	if err != nil {
-		return nil, err
-	}
-	if len(data) > limit {
-		return nil, fmt.Errorf("%w: more than the %d byte read limit", ErrTooLarge, limit)
-	}
-	return data, nil
-}
-
-func parseDocument(path string, data []byte, owner Component) (*Document, error) {
-	if len(strings.TrimSpace(string(data))) == 0 {
-		return nil, pathErrorf("parse", path, fmt.Errorf("%w: the file is empty", ErrCorrupt))
-	}
-
-	var doc Document
-	if err := json.Unmarshal(data, &doc); err != nil {
-		return nil, pathErrorf("parse", path, fmt.Errorf("%w: %v", ErrCorrupt, err))
-	}
-
-	if doc.SchemaVersion < MinSupportedSchema || doc.SchemaVersion > Schema {
-		return nil, pathErrorf("parse", path, &SchemaVersionError{
-			Found: doc.SchemaVersion, Min: MinSupportedSchema, Max: Schema,
-		})
-	}
-
-	// A file whose contents claim a different owner is not this component's
-	// state, whatever the name says. An older writer that stamped nothing is
-	// accepted: the name is then the only claim available.
-	if doc.Agent.Component != "" && doc.Agent.Component != owner {
-		return nil, pathErrorf("parse", path, fmt.Errorf(
-			"%w: %s contains a document owned by %q", ErrCorrupt, filepath.Base(path), doc.Agent.Component))
-	}
-
-	return &doc, nil
-}
-
-// --- writing ---
-
-// atomicReplace writes data to path by the only sequence that is safe for a
-// concurrent reader and for a power loss:
-//
-//	create a temporary file in the same directory
-//	write
-//	fsync the file
-//	close
-//	rename over the target
-//	fsync the directory
-//
-// Each step matters. The temporary file must share the directory, or the
-// rename is a cross-device copy and not atomic. The file sync must precede
-// the rename, or a crash can leave the directory pointing at a file with no
-// contents. The directory sync must follow it, or the rename itself can be
-// lost. On any failure the temporary file is removed and the previous version
-// of the target is untouched.
-func (s *Store) atomicReplace(path string, data []byte) error {
-	dir := filepath.Dir(path)
-	prefix := temporaryPrefix(filepath.Base(path))
-
-	f, err := s.fs.CreateTemp(dir, prefix, s.security.FileMode)
-	if err != nil {
-		return pathErrorf("createtemp", dir, err)
-	}
-
-	tmp := f.Name()
-	closed := false
-	committed := false
-	defer func() {
-		if !closed {
-			_ = f.Close()
-		}
-		if !committed {
-			// Best effort. If this fails the file is still a temporary name
-			// that no reader looks for, and the next successful write will
-			// not collide with it.
-			_ = s.fs.Remove(tmp)
-		}
-	}()
-
-	if _, err := f.Write(data); err != nil {
-		return pathErrorf("write", tmp, err)
-	}
-	if err := f.Sync(); err != nil {
-		return pathErrorf("fsync", tmp, err)
-	}
-	closed = true
-	if err := f.Close(); err != nil {
-		return pathErrorf("close", tmp, err)
-	}
-	if err := s.fs.Rename(tmp, path); err != nil {
-		return pathErrorf("rename", tmp, err)
-	}
-	committed = true
-
-	if err := s.fs.SyncDir(dir); err != nil {
-		// Past the point of no return. The rename has happened, every reader
-		// already sees the new version, and there is nothing to roll back
-		// to. All that is unproven is whether the directory entry survives a
-		// power loss.
-		//
-		// This has to be a distinguishable outcome rather than a plain
-		// error, because the two readings lead to opposite actions. A caller
-		// that reads "the write failed" from here will conclude the record
-		// it was about to act on is not on disk — and for an agent that
-		// records a pending fence before issuing it, that is exactly
-		// backwards.
-		return fmt.Errorf("%w: %s was replaced but the directory entry could not be flushed: %w",
-			ErrDurabilityUnconfirmed, path, pathErrorf("fsync", dir, err))
-	}
-	return nil
-}
-
-// --- quarantine ---
-
-// quarantine moves an unusable file aside, preserving its bytes exactly, and
-// returns the new path.
-//
-// Preserving the bytes is the point. The file is the only record of what the
-// agent believed before it broke, and the shape of the damage — truncated at
-// a block boundary, zero-filled, half of an older version — is what tells an
-// operator whether they are looking at a crash, a full disk or a filesystem
-// problem.
-//
-// Only the owner of a file ever calls this.
-func (s *Store) quarantine(path string) (string, error) {
-	stamp := s.clock.Now().UTC().Format(quarantineTimeLayout)
-	unique, err := randomSuffix()
-	if err != nil {
-		return "", err
-	}
-	dest := fmt.Sprintf("%s.%s-%s%s", path, stamp, unique[:8], quarantineSuffix)
-
-	if err := s.fs.Rename(path, dest); err != nil {
-		return "", pathErrorf("rename", path, err)
-	}
-	_, _ = s.sweep()
-	return dest, nil
-}
-
-// --- housekeeping ---
-//
-// Everything in this section removes files. None of it ever writes the live
-// document, which is replaced only by atomicReplace. That is what keeps the
-// guarantee intact under a crash: the worst a process killed in the middle of
-// housekeeping can leave behind is a file the next sweep reclaims, and a
-// reader at any instant still sees a whole state file or none.
-
-// CleanupReport says what a housekeeping pass removed. Log it, or feed the
-// counters to a metric: a node steadily accumulating orphans is a node whose
-// agent keeps dying mid-write.
-type CleanupReport struct {
-	// TemporaryFilesRemoved counts abandoned temporary files reclaimed. Each
-	// one is a write this component started and did not finish, so a non-zero
-	// count means the agent was killed between creating the file and renaming
-	// it into place.
-	TemporaryFilesRemoved int
-	// QuarantineFilesRemoved counts quarantined copies aged or pruned out.
-	QuarantineFilesRemoved int
-	// BytesReclaimed is the total size of everything removed, as far as the
-	// filesystem reported it.
-	BytesReclaimed int64
-}
-
-// Cleanup reclaims this component's abandoned files from the state directory
-// and returns what it removed.
-//
-// Two kinds accumulate. A temporary file is left behind whenever a process is
-// killed between creating it and renaming it into place — a panic, an
-// OOM kill, or the watchdog reset this product exists to cause. A quarantined
-// copy is left behind deliberately, as evidence, and is kept to a fixed
-// number and age.
-//
-// It is called for you: once per Store on the first write, and after every
-// quarantine. Call it directly from a periodic janitor on a long-lived agent,
-// or at start-up to get the counts into a log line.
-//
-// Only this component's files are touched, by the same ownership rule that
-// governs writing. A temporary file younger than the orphan grace period is
-// left alone, because it may belong to a write still in flight.
-func (s *Store) Cleanup(ctx context.Context) (*CleanupReport, error) {
-	if err := ctx.Err(); err != nil {
-		return nil, err
-	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.sweep()
-}
-
-// sweep performs one housekeeping pass. The caller holds s.mu.
-//
-// Failures are reported but not fatal to the caller that triggered the sweep:
-// being unable to tidy up is not a reason to fail a read or a write.
-func (s *Store) sweep() (*CleanupReport, error) {
-	s.swept = true
-	report := &CleanupReport{}
-
-	entries, err := s.fs.ReadDir(s.dir)
-	if err != nil {
-		if errors.Is(err, fs.ErrNotExist) {
-			return report, nil
-		}
-		return report, pathErrorf("readdir", s.dir, err)
-	}
-
-	base := filepath.Base(s.Path(s.self))
-	tempPrefix := temporaryPrefix(base)
-	quarantinePrefix := base + "."
-	now := s.clock.Now()
-
-	type candidate struct {
-		name string
-		size int64
-	}
-	var quarantined []candidate
-
-	remove := func(name string, size int64, counter *int) {
-		if err := s.fs.Remove(filepath.Join(s.dir, name)); err == nil {
-			*counter++
-			report.BytesReclaimed += size
-		}
-	}
-
-	for _, e := range entries {
-		name := e.Name()
-		switch {
-		case strings.HasPrefix(name, tempPrefix):
-			info, infoErr := e.Info()
-			if infoErr != nil {
-				continue // it went away underneath us, which is the outcome we wanted
-			}
-			// A write that has been in flight this long is not in flight. The
-			// grace period is what separates "a process died holding this"
-			// from "a process is writing this right now", and getting it
-			// wrong in the other direction would delete a live write.
-			if now.Sub(info.ModTime()) < s.orphanGrace {
-				continue
-			}
-			remove(name, info.Size(), &report.TemporaryFilesRemoved)
-
-		case strings.HasPrefix(name, quarantinePrefix) && strings.HasSuffix(name, quarantineSuffix):
-			var size int64
-			if info, infoErr := e.Info(); infoErr == nil {
-				if s.quarantineMaxAge > 0 && now.Sub(info.ModTime()) > s.quarantineMaxAge {
-					remove(name, info.Size(), &report.QuarantineFilesRemoved)
-					continue
-				}
-				size = info.Size()
-			}
-			quarantined = append(quarantined, candidate{name: name, size: size})
-		}
-	}
-
-	// Names sort chronologically because the timestamp embedded in them is
-	// fixed-width, so the oldest are the ones to drop.
-	if len(quarantined) > s.quarantineRetention {
-		sort.Slice(quarantined, func(i, j int) bool { return quarantined[i].name < quarantined[j].name })
-		for _, c := range quarantined[:len(quarantined)-s.quarantineRetention] {
-			remove(c.name, c.size, &report.QuarantineFilesRemoved)
-		}
-	}
-
-	return report, nil
-}
-
-// temporaryPrefix returns the name prefix atomicReplace gives the temporary
-// file it writes for base. The leading dot keeps it out of a casual listing
-// and, more usefully, out of the quarantine prefix's way.
-func temporaryPrefix(base string) string { return "." + base + ".tmp-" }

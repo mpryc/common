@@ -425,7 +425,7 @@ func TestCorruptQuarantine_SubsequentWriteSucceeds(t *testing.T) {
 func TestCorruptQuarantine_RetainsABoundedNumberOfFiles(t *testing.T) {
 	t.Parallel()
 
-	s, dir := newStore(t, nodestate.ComponentSBR, nodestate.WithQuarantineRetention(2))
+	s, dir := newStore(t, nodestate.ComponentSBR, nodestate.WithHousekeeping(nodestate.HousekeepingPolicy{QuarantineRetention: 2}))
 	ctx := context.Background()
 	path := filepath.Join(dir, nodestate.SBRFile)
 

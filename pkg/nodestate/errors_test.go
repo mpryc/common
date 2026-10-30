@@ -127,8 +127,10 @@ func TestOptions_RejectBadValues(t *testing.T) {
 	}{
 		{"nil clock", nodestate.WithClock(nil)},
 		{"empty writer id", nodestate.WithWriterID("")},
-		{"zero quarantine retention", nodestate.WithQuarantineRetention(0)},
-		{"negative quarantine retention", nodestate.WithQuarantineRetention(-1)},
+		{"negative quarantine retention", nodestate.WithHousekeeping(nodestate.HousekeepingPolicy{QuarantineRetention: -1})},
+		{"negative orphan grace", nodestate.WithHousekeeping(nodestate.HousekeepingPolicy{OrphanGrace: -time.Second})},
+		{"negative quarantine age", nodestate.WithHousekeeping(nodestate.HousekeepingPolicy{QuarantineMaxAge: -2 * time.Second})},
+		{"negative preserved bytes", nodestate.WithHousekeeping(nodestate.HousekeepingPolicy{MaxPreservedBytes: -5})},
 		{"negative retention", nodestate.WithRetention(nodestate.RetentionPolicy{MaxIOEntries: -5})},
 		{"inconsistent security policy", nodestate.WithSecurityPolicy(nodestate.SecurityPolicy{
 			DirMode: 0o777, FileMode: 0o600, ForbiddenDirModeBits: 0o077,
@@ -169,7 +171,7 @@ func TestOptions_AcceptValidValues(t *testing.T) {
 		nodestate.WithClock(clk),
 		nodestate.WithMaxDocumentBytes(1<<16),
 		nodestate.WithMaxReadBytes(1<<16),
-		nodestate.WithQuarantineRetention(1),
+		nodestate.WithHousekeeping(nodestate.HousekeepingPolicy{QuarantineRetention: 1}),
 	)
 	if err != nil {
 		t.Fatalf("New: %v", err)
