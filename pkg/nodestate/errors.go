@@ -62,6 +62,21 @@ var (
 	// read or on write. It bounds the memory a hostile or runaway file can cost.
 	ErrTooLarge = errors.New("nodestate: size limit exceeded")
 
+	// ErrDurabilityUnconfirmed means the replacement is already visible to
+	// every reader but may not survive a power loss, because the directory
+	// entry could not be flushed after the rename.
+	//
+	// It is the one error from a write that does NOT mean "nothing was
+	// written". A caller must treat the document as written: do not retry,
+	// and do not withhold an action that was waiting on the record being on
+	// disk. An agent that records a pending fence before issuing it should
+	// proceed with the fence.
+	//
+	// What it does mean is that a power loss in the next few seconds could
+	// lose the record, so it is worth an event and a metric. Repeated
+	// occurrences indicate a failing host path.
+	ErrDurabilityUnconfirmed = errors.New("nodestate: write is visible but its durability is unconfirmed")
+
 	// ErrForeignWrite means the file this Store owns was last written by
 	// someone else. This must never happen; see Store.Load and
 	// WithStrictOwnership for what the library does when it does.

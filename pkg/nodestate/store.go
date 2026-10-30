@@ -835,6 +835,14 @@ func containsComponent(list []Component, want Component) bool {
 // Write does not apply the retention policy — it writes what it is given, and
 // fails with ErrTooLarge if that exceeds the configured size. Prefer Update,
 // which loads, mutates, trims and writes in one serialised step.
+//
+// One error does not mean the write was lost. ErrDurabilityUnconfirmed says
+// the replacement is already visible and only its survival across a power
+// loss is unproven; treat the document as written. Every other error means
+// the previous version is still in place and nothing changed. A caller that
+// gates an action on the record reaching disk — recording a pending fence
+// before issuing it — must distinguish the two, or it will withhold a fence
+// whose record is already there.
 func (s *Store) Write(ctx context.Context, doc *Document) error {
 	return s.WriteTo(ctx, s.self, doc)
 }
@@ -898,13 +906,19 @@ func (s *Store) writeLocked(doc *Document) error {
 		_, _ = s.sweep()
 	}
 
-	if err := s.atomicReplace(s.Path(s.self), encoded); err != nil {
+	err = s.atomicReplace(s.Path(s.self), encoded)
+	if err != nil && !errors.Is(err, ErrDurabilityUnconfirmed) {
 		return err
 	}
 
+	// Commit the bookkeeping for an unconfirmed-durability result too. The
+	// new version is on disk and visible; pretending otherwise would reissue
+	// this revision on the next write, leaving two different documents
+	// claiming the same one and breaking the ordering that foreign-write
+	// detection reads.
 	s.lastRevision = doc.Revision
 	s.haveWritten = true
-	return nil
+	return err
 }
 
 // nextRevision never lets the revision go backwards, including when the file
@@ -956,6 +970,10 @@ func encodeDocument(doc *Document) ([]byte, error) {
 // recover, the mutator sees a fresh document already carrying an
 // EventReasonStateFileRecovered entry, which is both the signal and the
 // durable record.
+//
+// Update returns a non-nil document together with ErrDurabilityUnconfirmed:
+// that write is visible and only its durability is in doubt. For every other
+// error the document is nil and nothing was written. See Write.
 func (s *Store) Update(ctx context.Context, mutate func(*Document) error) (*Document, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
@@ -986,6 +1004,11 @@ func (s *Store) Update(ctx context.Context, mutate func(*Document) error) (*Docu
 
 	s.retention.Apply(doc, s.clock.Now())
 	if err := s.writeLocked(doc); err != nil {
+		if errors.Is(err, ErrDurabilityUnconfirmed) {
+			// Written and visible. Hand back the document as well as the
+			// error so the caller can act on what it recorded.
+			return doc, err
+		}
 		return nil, err
 	}
 	return doc, nil
@@ -1154,10 +1177,19 @@ func (s *Store) atomicReplace(path string, data []byte) error {
 	committed = true
 
 	if err := s.fs.SyncDir(dir); err != nil {
-		// The rename has already happened and is visible. This only means it
-		// might not survive a power loss, so it is reported rather than
-		// rolled back — there is nothing to roll back to.
-		return pathErrorf("fsync", dir, err)
+		// Past the point of no return. The rename has happened, every reader
+		// already sees the new version, and there is nothing to roll back
+		// to. All that is unproven is whether the directory entry survives a
+		// power loss.
+		//
+		// This has to be a distinguishable outcome rather than a plain
+		// error, because the two readings lead to opposite actions. A caller
+		// that reads "the write failed" from here will conclude the record
+		// it was about to act on is not on disk — and for an agent that
+		// records a pending fence before issuing it, that is exactly
+		// backwards.
+		return fmt.Errorf("%w: %s was replaced but the directory entry could not be flushed: %w",
+			ErrDurabilityUnconfirmed, path, pathErrorf("fsync", dir, err))
 	}
 	return nil
 }
