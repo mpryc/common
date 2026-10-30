@@ -125,12 +125,18 @@
 //
 // Store.Update applies the retention policy on every write: the I/O and event
 // logs are rings, conditions are capped, and reboot records are trimmed by
-// age. Reboots are never trimmed by count, because a node in a reboot loop is
-// the node with the most records and discarding them would hand it a fresh
-// budget; the count ceiling that does exist is an outer bound, sized to keep
-// a full document inside the write limit, and it moves
-// Document.RebootHistoryCompleteSince rather than pretending the history is
-// still whole.
+// age. Reboots are not trimmed by count in normal operation, because a node
+// in a reboot loop is the node with the most records and discarding them
+// would hand it a fresh budget.
+//
+// Two bounds qualify that, in opposite directions. Below, a floor the age
+// trim will not go under whatever the records' apparent age: the clock is the
+// trim's only input and is least trustworthy exactly when this matters, on a
+// node returning from a total outage with NTP about to step it. Above, an
+// outer ceiling sized to keep a full document inside the write limit, because
+// an agent that cannot write its state file is in the worst position of all.
+// Whenever either bound drops a record, Document.RebootHistoryCompleteSince
+// moves rather than the history pretending to still be whole.
 //
 // Store.Cleanup reclaims what is left in the directory rather than in the
 // document: temporary files abandoned by a process that was killed mid-write,

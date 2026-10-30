@@ -131,8 +131,10 @@ func rebootSortKey(e RebootEntry) string {
 //
 // A nil match counts everything.
 //
-// Check Document.RebootHistoryTruncated on the inputs before trusting a count
-// to be complete.
+// A count is only an answer if the history covers the window it is taken
+// over. Ask RebootHistoryComplete with the same documents and the same start
+// instant; when it reports false, this count is a lower bound and the caller
+// must fail toward counting.
 func CountReboots(since time.Time, match func(RebootEntry) bool, docs ...*Document) int {
 	n := 0
 	for _, entry := range MergeReboots(docs...) {

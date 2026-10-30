@@ -115,9 +115,14 @@ type Document struct {
 	// Events is a bounded ring of recent notable occurrences, newest last.
 	Events []EventEntry `json:"events,omitempty"`
 
-	// Reboots is the reboot history, oldest first. It is trimmed by age and
-	// never by count, because dropping the oldest entries of a looping node
-	// would hand it a fresh reboot budget.
+	// Reboots is the reboot history, oldest first.
+	//
+	// It is trimmed by age, never routinely by count, because dropping the
+	// oldest entries of a looping node would hand it a fresh reboot budget.
+	// Two bounds qualify that: a floor below which the age trim will not go,
+	// so a stepped clock cannot erase the history, and an outer ceiling that
+	// keeps the document writable. Both move RebootHistoryCompleteSince when
+	// they bite. See RetentionPolicy.
 	Reboots []RebootEntry `json:"reboots"`
 
 	// RebootHistoryCompleteSince is the earliest instant from which Reboots

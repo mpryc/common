@@ -136,8 +136,23 @@ type LoadResult struct {
 	// ErrInsecureOwner or ErrTooLarge.
 	Cause error
 
-	// QuarantinePath is where the unusable file was moved, when there was one.
+	// QuarantinePath is where the unusable file was moved, when there was one
+	// and the move succeeded.
 	QuarantinePath string
+
+	// QuarantineFailed reports that an unusable file could not be moved
+	// aside, so it is still in place and Document exists only in memory.
+	//
+	// This is a host-path fault — a read-only root filesystem, a wrong
+	// SELinux label, a directory this agent may read but not write — and the
+	// agent will not be able to write its own state either. It can still
+	// run: it simply has no durable memory until the path is fixed. Surface
+	// it, because every reboot budget on this node is now computed from
+	// nothing.
+	QuarantineFailed bool
+
+	// QuarantineError is why the move failed, when QuarantineFailed is set.
+	QuarantineError error
 
 	// ForeignWrite reports that the file was last written by someone other
 	// than this Store, which should be impossible under the single-writer
@@ -573,15 +588,18 @@ func (s *Store) ensureDirectory() error {
 //
 // Load always returns a usable Document unless it returns an error, and it
 // returns an error only for a condition the caller cannot work around: a
-// cancelled context, a state directory that violates the security policy, or
-// a failure to move an unusable file out of the way. Everything about the
-// file's *contents* is handled here:
+// cancelled context, or a state directory that violates the security policy.
+// Everything about the file's *contents* is handled here:
 //
 //   - no file: StatusAbsent and a fresh document;
 //   - unreadable or unparseable: the file is quarantined with its bytes
 //     intact, and StatusRecovered is returned with a fresh document;
 //   - a schema version this build does not support: quarantined likewise,
-//     StatusIncompatible.
+//     StatusIncompatible;
+//   - unusable and unmovable, because the host path cannot be written: still
+//     StatusRecovered with a fresh in-memory document, and
+//     QuarantineFailed set. The agent gets to run and classify its start-up
+//     rather than failing to start at all.
 //
 // Quarantining is a write, and a Store only writes its own file. A peer's
 // damaged file is never touched — see ReadPeer.
@@ -644,13 +662,16 @@ func (s *Store) loadLocked() (*LoadResult, error) {
 		status = StatusIncompatible
 	}
 
+	// The file cannot be used. Move it aside, preserving its bytes, and start
+	// fresh.
+	//
+	// When even that fails — a read-only root filesystem, a wrong SELinux
+	// label, a directory the agent may read but not write — the caller still
+	// gets a usable document. It was going to start from nothing either way,
+	// and refusing to hand it one only means the agent cannot classify its
+	// start-up or run at all. The flag tells it that what it is holding is
+	// in memory and that the damaged file is still in place underneath.
 	quarantined, qerr := s.quarantine(path)
-	if qerr != nil {
-		// The file cannot be used and cannot be moved aside. Writing over it
-		// would destroy evidence of whatever is wrong with this host path, so
-		// the caller is told instead.
-		return nil, fmt.Errorf("nodestate: %s is unusable (%v) and could not be quarantined: %w", path, err, qerr)
-	}
 
 	// Record the loss in the fresh document as well as in the result.
 	//
@@ -661,19 +682,26 @@ func (s *Store) loadLocked() (*LoadResult, error) {
 	// nothing anywhere to say so. The event ring is the file's own record of
 	// what happened to it, which is exactly what a post-mortem reads.
 	fresh := s.newDocument()
+	message := fmt.Sprintf("the previous state file was unusable and was quarantined at %s; "+
+		"history before this point is lost: %v", filepath.Base(quarantined), err)
+	if qerr != nil {
+		message = fmt.Sprintf("the previous state file is unusable and could not be moved aside (%v); "+
+			"history before this point is lost and this document is in memory only: %v", qerr, err)
+	}
 	fresh.AppendEvent(EventEntry{
-		TS:     s.clock.Now(),
-		Type:   "Warning",
-		Reason: EventReasonStateFileRecovered,
-		Message: fmt.Sprintf("the previous state file was unusable and was quarantined at %s; history before this point is lost: %v",
-			filepath.Base(quarantined), err),
+		TS:      s.clock.Now(),
+		Type:    "Warning",
+		Reason:  EventReasonStateFileRecovered,
+		Message: message,
 	})
 
 	return &LoadResult{
-		Document:       fresh,
-		Status:         status,
-		Cause:          err,
-		QuarantinePath: quarantined,
+		Document:         fresh,
+		Status:           status,
+		Cause:            err,
+		QuarantinePath:   quarantined,
+		QuarantineFailed: qerr != nil,
+		QuarantineError:  qerr,
 	}, nil
 }
 

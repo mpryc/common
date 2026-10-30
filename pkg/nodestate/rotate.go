@@ -69,8 +69,9 @@ type RetentionPolicy struct {
 	RebootMaxAge time.Duration
 
 	// MaxRebootEntries is a safety ceiling on Document.Reboots, applied after
-	// the age trim. Exceeding it sets Document.RebootHistoryTruncated so that
-	// a caller computing a budget knows to fail toward counting.
+	// the age trim. Exceeding it moves Document.RebootHistoryCompleteSince
+	// forward, so a caller computing a budget over a window that reaches
+	// past it is told the count is a lower bound.
 	//
 	// Reaching this is a signal in itself. Do not lower it to control file
 	// size; lower RebootMaxAge instead.
