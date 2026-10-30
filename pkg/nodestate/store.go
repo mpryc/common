@@ -67,6 +67,12 @@ const (
 	// gone, and any budget computed from it restarts at zero.
 	EventReasonStateFileRecovered = "StateFileRecovered"
 
+	// EventReasonClockWentBackwards is the Reason recorded when the wall
+	// clock reads earlier than the previous write of this file. Durations
+	// derived from the history across that point are unreliable, which
+	// matters to anything computing a reboot budget over a time window.
+	EventReasonClockWentBackwards = "ClockWentBackwards"
+
 	// EventReasonPreservedFieldsDropped is the Reason recorded when members
 	// written by a newer peer exceeded the preservation ceiling and were
 	// dropped rather than carried forward. It means a staggered upgrade will

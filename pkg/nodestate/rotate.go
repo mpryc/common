@@ -32,6 +32,12 @@ const (
 	// fails if that balance is ever broken.
 	DefaultMaxRebootEntries = 1024
 
+	// DefaultMinRebootEntries is the floor the age trim will not go below.
+	// Sixteen records is about 8 KiB and more than any plausible budget
+	// window needs, so the floor never binds in normal operation; it exists
+	// only so that a wrong clock cannot erase the history in one pass.
+	DefaultMinRebootEntries = 16
+
 	// DefaultMaxConditions caps the condition set. A well-behaved agent
 	// publishes a handful of condition types, so this is an outer bound on a
 	// caller mistake rather than a working limit.
@@ -70,6 +76,19 @@ type RetentionPolicy struct {
 	// size; lower RebootMaxAge instead.
 	MaxRebootEntries int
 
+	// MinRebootEntries is the number of most recent reboot records the age
+	// trim will never go below, whatever their apparent age.
+	//
+	// It guards against the wall clock, which is the only input the age trim
+	// has and is least trustworthy at exactly the moment this matters: a node
+	// returning from a total outage, where NTP steps the clock and every
+	// record suddenly looks ancient. Without the floor a single step erases
+	// the history, and an erased history is a fresh reboot budget for a node
+	// that may be in a reboot loop.
+	//
+	// Zero disables the floor and restores pure age-based trimming.
+	MinRebootEntries int
+
 	// MaxConditions caps Document.Conditions, dropping the least recently
 	// observed. See trimConditions for why this exists at all.
 	MaxConditions int
@@ -83,6 +102,7 @@ func DefaultRetention() RetentionPolicy {
 		MaxEventEntries:  DefaultMaxEventEntries,
 		RebootMaxAge:     DefaultRebootRetention,
 		MaxRebootEntries: DefaultMaxRebootEntries,
+		MinRebootEntries: DefaultMinRebootEntries,
 		MaxConditions:    DefaultMaxConditions,
 	}
 }
@@ -97,6 +117,13 @@ func (p RetentionPolicy) Validate() error {
 	}
 	if p.MaxRebootEntries < 0 {
 		return fmt.Errorf("retention policy: MaxRebootEntries is %d", p.MaxRebootEntries)
+	}
+	if p.MinRebootEntries < 0 {
+		return fmt.Errorf("retention policy: MinRebootEntries is %d", p.MinRebootEntries)
+	}
+	if p.MaxRebootEntries > 0 && p.MinRebootEntries > p.MaxRebootEntries {
+		return fmt.Errorf("retention policy: MinRebootEntries %d exceeds MaxRebootEntries %d",
+			p.MinRebootEntries, p.MaxRebootEntries)
 	}
 	if p.MaxConditions < 0 {
 		return fmt.Errorf("retention policy: MaxConditions is %d", p.MaxConditions)
@@ -120,6 +147,15 @@ func (p RetentionPolicy) Apply(d *Document, now time.Time) {
 		return
 	}
 
+	// A completeness point later than the present cannot be true: it would
+	// claim the history begins in the future. Reaching here means an earlier
+	// pass ran against a clock that was wrong, so discard the claim and let
+	// this pass derive a fresh one.
+	if d.RebootHistoryCompleteSince.After(now) {
+		d.RebootHistoryCompleteSince = time.Time{}
+	}
+	p.noteClockRegression(d, now)
+
 	d.IO = tail(d.IO, p.MaxIOEntries)
 	d.Events = tail(d.Events, p.MaxEventEntries)
 
@@ -129,50 +165,114 @@ func (p RetentionPolicy) Apply(d *Document, now time.Time) {
 		})
 	}
 
-	if p.RebootMaxAge > 0 {
-		cutoff := now.Add(-p.RebootMaxAge)
-		kept := d.Reboots[:0]
-		for _, r := range d.Reboots {
-			// An entry with no timestamp is kept: it is more likely a writer
-			// that forgot to stamp it than a record from before the epoch, and
-			// the failure direction for a budget is to count, not to forget.
-			if r.TS.IsZero() || !r.TS.Before(cutoff) {
-				kept = append(kept, r)
-			}
-		}
-		clearTail(d.Reboots, len(kept))
-		d.Reboots = kept
-
-		// The horizon moves whether or not anything was dropped this time:
-		// under a seven day policy the file cannot answer a question about
-		// day eight, and saying so is the honest position.
-		advanceHorizon(d, cutoff)
-	}
-
-	if p.MaxRebootEntries > 0 && len(d.Reboots) > p.MaxRebootEntries {
-		drop := len(d.Reboots) - p.MaxRebootEntries
-		d.Reboots = append(d.Reboots[:0], d.Reboots[drop:]...)
-		clearTail(d.Reboots[:cap(d.Reboots)], len(d.Reboots))
-
-		// Everything from the oldest surviving record onward is intact, and
-		// nothing before it can be relied on.
-		if len(d.Reboots) > 0 {
-			advanceHorizon(d, d.Reboots[0].TS)
-		} else {
-			advanceHorizon(d, now)
-		}
-	}
-
+	p.trimRebootsByAge(d, now)
+	p.trimRebootsByCount(d, now)
 	p.trimConditions(d)
 }
 
-// advanceHorizon moves the completeness point forward, never backward. A
-// later horizon is a weaker claim, and the weaker claim is always the safe
-// one to keep.
+// trimRebootsByAge drops records older than the retention window, subject to
+// the floor described on MinRebootEntries.
+func (p RetentionPolicy) trimRebootsByAge(d *Document, now time.Time) {
+	if p.RebootMaxAge <= 0 || len(d.Reboots) == 0 {
+		return
+	}
+	cutoff := now.Add(-p.RebootMaxAge)
+
+	var keep, dropped []RebootEntry
+	for _, r := range d.Reboots {
+		// An entry with no timestamp is kept: it is more likely a writer that
+		// forgot to stamp it than a record from before the epoch, and the
+		// failure direction for a budget is to count, not to forget.
+		if r.TS.IsZero() || !r.TS.Before(cutoff) {
+			keep = append(keep, r)
+			continue
+		}
+		dropped = append(dropped, r)
+	}
+
+	// The floor. Records are only ever deleted on the word of the wall clock,
+	// and the wall clock is least trustworthy exactly when this matters: the
+	// node has just come back from a total outage and NTP has stepped it. A
+	// single forward step makes every record look ancient and would otherwise
+	// erase the whole history in one pass, which hands a node in a reboot
+	// loop a clean budget. Keeping the most recent few regardless of apparent
+	// age costs a few kilobytes and makes a bad clock non-destructive.
+	if p.MinRebootEntries > 0 && len(keep) < p.MinRebootEntries && len(dropped) > 0 {
+		short := p.MinRebootEntries - len(keep)
+		if short > len(dropped) {
+			short = len(dropped)
+		}
+		keep = append(keep, dropped[len(dropped)-short:]...)
+		dropped = dropped[:len(dropped)-short]
+		sort.SliceStable(keep, func(i, j int) bool { return keep[i].TS.Before(keep[j].TS) })
+	}
+
+	clearTail(d.Reboots, 0)
+	d.Reboots = keep
+	if len(dropped) > 0 {
+		advanceHorizon(d, oldestRetained(d, now))
+	}
+}
+
+// trimRebootsByCount enforces the safety ceiling.
+func (p RetentionPolicy) trimRebootsByCount(d *Document, now time.Time) {
+	if p.MaxRebootEntries <= 0 || len(d.Reboots) <= p.MaxRebootEntries {
+		return
+	}
+	drop := len(d.Reboots) - p.MaxRebootEntries
+	d.Reboots = append(d.Reboots[:0], d.Reboots[drop:]...)
+	clearTail(d.Reboots[:cap(d.Reboots)], len(d.Reboots))
+	advanceHorizon(d, oldestRetained(d, now))
+}
+
+// oldestRetained returns the timestamp from which the surviving records are
+// known to be complete: the oldest one still held, or now when none are.
+//
+// An entry with no timestamp is skipped, because it cannot support a claim
+// about when the history begins.
+func oldestRetained(d *Document, now time.Time) time.Time {
+	for _, r := range d.Reboots {
+		if !r.TS.IsZero() {
+			return r.TS
+		}
+	}
+	return now
+}
+
+// advanceHorizon moves the completeness point forward, never backward, and
+// only when records were actually dropped.
+//
+// Never backward because a later horizon is the weaker claim, and the weaker
+// claim is the safe one. Only on an actual drop because the alternative —
+// moving it to the retention cutoff on every pass — would let one bad clock
+// reading pin it in the future and mark the node's history untrustworthy for
+// good.
 func advanceHorizon(d *Document, at time.Time) {
 	if at.After(d.RebootHistoryCompleteSince) {
 		d.RebootHistoryCompleteSince = at
 	}
+}
+
+// noteClockRegression records a wall clock that has moved backwards since the
+// last write.
+//
+// Only backwards. A clock that has jumped forwards is indistinguishable from
+// a node that was powered off for a long time, and guessing would produce a
+// warning on every maintenance window. That is why the floor in
+// trimRebootsByAge exists: the forward case is handled by not trusting the
+// clock with destruction, rather than by trying to detect it.
+func (p RetentionPolicy) noteClockRegression(d *Document, now time.Time) {
+	if d.UpdatedAt.IsZero() || !now.Before(d.UpdatedAt) {
+		return
+	}
+	d.AppendEvent(EventEntry{
+		TS:     now,
+		Type:   "Warning",
+		Reason: EventReasonClockWentBackwards,
+		Message: fmt.Sprintf("the clock reads %s but this file was last written at %s, %s later; "+
+			"timings derived from the history before this point are unreliable",
+			now.UTC().Format(time.RFC3339), d.UpdatedAt.UTC().Format(time.RFC3339), d.UpdatedAt.Sub(now)),
+	})
 }
 
 // trimConditions bounds the condition set.

@@ -102,6 +102,7 @@ func TestRotation_RebootsHaveASafetyCeiling(t *testing.T) {
 	now := time.Date(2024, 7, 11, 0, 0, 0, 0, time.UTC)
 	policy := nodestate.DefaultRetention()
 	policy.MaxRebootEntries = 10
+	policy.MinRebootEntries = 5 // the floor must stay at or below the ceiling
 
 	doc := nodestate.NewDocument(nodestate.ComponentSBR)
 	for i := 0; i < 25; i++ {
