@@ -15,7 +15,7 @@ var mergeBase = time.Date(2024, 8, 1, 0, 0, 0, 0, time.UTC)
 func TestMergeReboots_OneRemediationCountsOnce(t *testing.T) {
 	t.Parallel()
 
-	ref := &nodestate.CRRef{Kind: "SelfNodeRemediation", Name: "worker-0", UID: "uid-1", Generation: 2}
+	ref := &nodestate.CRRef{NodeUID: "node-uid", Kind: "SelfNodeRemediation", Name: "worker-0", UID: "uid-1", Generation: 2}
 
 	snr := nodestate.NewDocument(nodestate.ComponentSNR)
 	snr.AppendReboot(nodestate.RebootEntry{
@@ -44,19 +44,19 @@ func TestMergeReboots_OneRemediationCountsOnce(t *testing.T) {
 	}
 }
 
-func TestMergeReboots_DifferentGenerationsAreDifferentReboots(t *testing.T) {
+func TestMergeReboots_DifferentGenerationsAreTheSameRequest(t *testing.T) {
 	t.Parallel()
 
 	doc := nodestate.NewDocument(nodestate.ComponentSBR)
 	doc.AppendReboot(nodestate.RebootEntry{
-		TS: mergeBase, Remediation: &nodestate.CRRef{UID: "uid-1", Generation: 1},
+		TS: mergeBase, Remediation: &nodestate.CRRef{NodeUID: "node-uid", UID: "uid-1", Generation: 1},
 	})
 	doc.AppendReboot(nodestate.RebootEntry{
-		TS: mergeBase.Add(time.Hour), Remediation: &nodestate.CRRef{UID: "uid-1", Generation: 2},
+		TS: mergeBase.Add(time.Hour), Remediation: &nodestate.CRRef{NodeUID: "node-uid", UID: "uid-1", Generation: 2},
 	})
 
-	if got := len(nodestate.MergeReboots(doc)); got != 2 {
-		t.Fatalf("got %d entries, want 2", got)
+	if got := len(nodestate.MergeReboots(doc)); got != 1 {
+		t.Fatalf("got %d entries, want 1", got)
 	}
 }
 
@@ -105,11 +105,11 @@ func TestMergeReboots_DoesNotMutateItsInputs(t *testing.T) {
 
 	doc := nodestate.NewDocument(nodestate.ComponentSBR)
 	doc.AppendReboot(nodestate.RebootEntry{
-		TS: mergeBase, Completed: false, Remediation: &nodestate.CRRef{UID: "u", Generation: 1},
+		TS: mergeBase, Completed: false, Remediation: &nodestate.CRRef{NodeUID: "node-uid", UID: "u", Generation: 1},
 	})
 	other := nodestate.NewDocument(nodestate.ComponentSNR)
 	other.AppendReboot(nodestate.RebootEntry{
-		TS: mergeBase, Completed: true, Remediation: &nodestate.CRRef{UID: "u", Generation: 1},
+		TS: mergeBase, Completed: true, Remediation: &nodestate.CRRef{NodeUID: "node-uid", UID: "u", Generation: 1},
 	})
 
 	_ = nodestate.MergeReboots(doc, other)
@@ -127,7 +127,7 @@ func TestCountReboots(t *testing.T) {
 	sbr.AppendReboot(nodestate.RebootEntry{TS: mergeBase.Add(-1 * time.Hour), Method: nodestate.MethodWatchdog})
 	sbr.AppendReboot(nodestate.RebootEntry{
 		TS: mergeBase.Add(-30 * time.Minute), Method: nodestate.MethodWatchdog,
-		Remediation: &nodestate.CRRef{UID: "uid-9", Generation: 1},
+		Remediation: &nodestate.CRRef{NodeUID: "node-uid", UID: "uid-9", Generation: 1},
 	})
 
 	autonomous := func(r nodestate.RebootEntry) bool { return r.Remediation == nil }
@@ -150,7 +150,7 @@ func TestCountReboots(t *testing.T) {
 func TestFindReboot(t *testing.T) {
 	t.Parallel()
 
-	ref := nodestate.CRRef{Kind: "SBR", Name: "worker-0", UID: "uid-1", Generation: 3}
+	ref := nodestate.CRRef{NodeUID: "node-uid", Kind: "SBR", Name: "worker-0", UID: "uid-1", Generation: 3}
 
 	sbr := nodestate.NewDocument(nodestate.ComponentSBR)
 	sbr.AppendReboot(nodestate.RebootEntry{TS: mergeBase, Remediation: &ref, Completed: true})
@@ -163,10 +163,10 @@ func TestFindReboot(t *testing.T) {
 		t.Error("the found entry lost its completed flag")
 	}
 
-	if _, ok := nodestate.FindReboot(nodestate.CRRef{UID: "uid-1", Generation: 4}, sbr); ok {
-		t.Error("FindReboot matched a different generation")
+	if _, ok := nodestate.FindReboot(nodestate.CRRef{NodeUID: "node-uid", UID: "uid-1", Generation: 4}, sbr); !ok {
+		t.Error("FindReboot failed to match the same request at a later generation")
 	}
-	if _, ok := nodestate.FindReboot(nodestate.CRRef{UID: "other", Generation: 3}, sbr); ok {
+	if _, ok := nodestate.FindReboot(nodestate.CRRef{NodeUID: "node-uid", UID: "other", Generation: 3}, sbr); ok {
 		t.Error("FindReboot matched a different UID")
 	}
 	if _, ok := nodestate.FindReboot(ref); ok {
@@ -188,22 +188,19 @@ func TestPendingReboots(t *testing.T) {
 }
 
 func TestCRRef_Key(t *testing.T) {
-	t.Parallel()
-
-	a := nodestate.CRRef{Kind: "SBR", Namespace: "ns", Name: "n", UID: "uid-1", Generation: 1}
-	b := nodestate.CRRef{Kind: "Other", Namespace: "other", Name: "other", UID: "uid-1", Generation: 1}
+	a := nodestate.CRRef{UID: "request", NodeUID: "node", Generation: 1}
+	b := a
+	b.Generation = 2
+	b.Name = "changed"
+	b.Namespace = "changed"
 	if a.Key() != b.Key() {
-		t.Errorf("Key is not UID+generation based: %q vs %q", a.Key(), b.Key())
+		t.Fatal("generation or names changed identity")
 	}
-
-	c := a
-	c.Generation = 2
-	if a.Key() == c.Key() {
-		t.Error("Key ignores the generation")
+	b.NodeUID = "replacement"
+	if a.Key() == b.Key() {
+		t.Fatal("Node UID missing from identity")
 	}
-
-	var zero nodestate.CRRef
-	if zero.Key() == a.Key() {
-		t.Error("the zero reference collides with a real one")
+	if (nodestate.CRRef{UID: "request"}).Key() != "" {
+		t.Fatal("legacy identity accepted")
 	}
 }

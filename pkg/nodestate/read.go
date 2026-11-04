@@ -17,6 +17,9 @@ import (
 // ErrNotRegular, ErrInsecurePermissions, ErrInsecureOwner, ErrTooLarge,
 // ErrCorrupt or ErrSchemaUnsupported.
 func (s *Store) readDocument(path string, owner Component) (*Document, error) {
+	if err := s.verifyDirectoryIfPresent(); err != nil {
+		return nil, err
+	}
 	stat := s.fs.Lstat
 	fromLstat := true
 	if s.security.AllowSymlinks {

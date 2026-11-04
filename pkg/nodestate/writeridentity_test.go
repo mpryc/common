@@ -37,6 +37,7 @@ func TestTwoStoresInOneProcessAreNotForeignToEachOther(t *testing.T) {
 			"the identity must describe the process", a.WriterID(), b.WriterID())
 	}
 
+	mustInitialize(t, a)
 	if _, err := a.Update(ctx, func(d *nodestate.Document) error { d.Node = "worker-0"; return nil }); err != nil {
 		t.Fatal(err)
 	}
@@ -144,6 +145,7 @@ func TestRestartIsNotAForeignWrite(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	mustInitialize(t, first)
 	if _, err := first.Update(ctx, func(d *nodestate.Document) error { d.Node = "worker-0"; return nil }); err != nil {
 		t.Fatal(err)
 	}

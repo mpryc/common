@@ -186,20 +186,12 @@ func TestNoSymlinkFollow(t *testing.T) {
 			t.Skipf("symlinks unavailable: %v", err)
 		}
 
-		res, err := s.Load(context.Background())
-		if err != nil {
+		_, err := s.Load(context.Background())
+		if !errors.Is(err, nodestate.ErrSymlink) {
 			t.Fatalf("Load: %v", err)
 		}
-		if res.Status != nodestate.StatusRecovered {
-			t.Fatalf("Status = %v, want StatusRecovered", res.Status)
-		}
-		if !errors.Is(res.Cause, nodestate.ErrSymlink) {
-			t.Errorf("Cause = %v, want ErrSymlink", res.Cause)
-		}
-		if res.Document.Node == "attacker" {
-			t.Fatal("content was read through the symlink")
-		}
-		// The symlink is moved aside; the file it pointed at is untouched.
+
+		// Both the symlink and its target remain untouched.
 		if _, err := os.Lstat(target); err != nil {
 			t.Errorf("the symlink target was disturbed: %v", err)
 		}
@@ -218,7 +210,7 @@ func TestNoSymlinkFollow(t *testing.T) {
 			t.Skipf("symlinks unavailable: %v", err)
 		}
 
-		if err := s.Write(context.Background(), nodestate.NewDocument(nodestate.ComponentSBR)); err != nil {
+		if err := s.Write(context.Background(), nodestate.NewDocument(nodestate.ComponentSBR)); !errors.Is(err, nodestate.ErrSymlink) {
 			t.Fatalf("Write: %v", err)
 		}
 
@@ -233,8 +225,8 @@ func TestNoSymlinkFollow(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if fi.Mode()&os.ModeSymlink != 0 {
-			t.Error("the state file is still a symlink after a write")
+		if fi.Mode()&os.ModeSymlink == 0 {
+			t.Error("the refused write changed the symlink")
 		}
 	})
 
@@ -267,44 +259,27 @@ func TestNoSymlinkFollow(t *testing.T) {
 }
 
 func TestLoad_RefusesANonRegularFile(t *testing.T) {
-	t.Parallel()
-
 	s, dir := newStore(t, nodestate.ComponentSBR)
-	if err := os.Mkdir(filepath.Join(dir, nodestate.SBRFile), 0o700); err != nil {
+	if err := os.Mkdir(filepath.Join(dir, nodestate.SBRFile), 0700); err != nil {
 		t.Fatal(err)
 	}
-
-	res, err := s.Load(context.Background())
-	if err != nil {
-		t.Fatalf("Load: %v", err)
-	}
-	if res.Status != nodestate.StatusRecovered || !errors.Is(res.Cause, nodestate.ErrNotRegular) {
-		t.Fatalf("Status = %v, Cause = %v; want StatusRecovered and ErrNotRegular", res.Status, res.Cause)
+	if _, err := s.Load(context.Background()); !errors.Is(err, nodestate.ErrNotRegular) {
+		t.Fatal(err)
 	}
 }
 
 func TestLoad_WorldWritableOwnFileIsAFault(t *testing.T) {
-	t.Parallel()
-
 	s, dir := newStore(t, nodestate.ComponentSBR)
 	path := filepath.Join(dir, nodestate.SBRFile)
 	mustWrite(t, path, `{"schemaVersion":1,"node":"worker-0"}`)
-	if err := os.Chmod(path, 0o666); err != nil {
+	if err := os.Chmod(path, 0666); err != nil {
 		t.Fatal(err)
 	}
-
-	res, err := s.Load(context.Background())
-	if err != nil {
-		t.Fatalf("Load: %v", err)
+	if _, err := s.Load(context.Background()); !errors.Is(err, nodestate.ErrInsecurePermissions) {
+		t.Fatal(err)
 	}
-	if res.Status != nodestate.StatusRecovered {
-		t.Fatalf("Status = %v, want StatusRecovered", res.Status)
-	}
-	if !errors.Is(res.Cause, nodestate.ErrInsecurePermissions) {
-		t.Errorf("Cause = %v, want ErrInsecurePermissions", res.Cause)
-	}
-	if res.Document.Node == "worker-0" {
-		t.Error("the contents of a world-writable state file were trusted")
+	if _, err := os.Stat(path); err != nil {
+		t.Fatal("file was moved")
 	}
 }
 

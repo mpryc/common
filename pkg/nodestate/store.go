@@ -29,15 +29,8 @@ const (
 	// and log scrapers can find them with one glob.
 	quarantineSuffix = ".corrupt"
 
-	// quarantineTimeLayout is fixed-width and lexically sortable, which is
-	// what lets the pruner order quarantined files by name alone.
-	quarantineTimeLayout = "20060102T150405.000000000Z"
-
-	// EventReasonStateFileRecovered is the Reason this package writes into
-	// Document.Events when it quarantines an unusable file and starts fresh.
-	// A caller that surfaces state-file events to Kubernetes should give this
-	// one a warning event of its own: it means the node's recorded history is
-	// gone, and any budget computed from it restarts at zero.
+	// EventReasonStateFileRecovered is retained for decoding legacy event logs.
+	// Deprecated: recovery is explicit and unknown budgets never restart at zero.
 	EventReasonStateFileRecovered = "StateFileRecovered"
 
 	// EventReasonClockWentBackwards is the Reason recorded when the wall
@@ -46,11 +39,8 @@ const (
 	// matters to anything computing a reboot budget over a time window.
 	EventReasonClockWentBackwards = "ClockWentBackwards"
 
-	// EventReasonPreservedFieldsDropped is the Reason recorded when members
-	// written by a newer peer exceeded the preservation ceiling and were
-	// dropped rather than carried forward. It means a staggered upgrade will
-	// lose that peer's data through this agent, which is worth an alert even
-	// though the alternative was worse. See Store.capPreserved.
+	// EventReasonPreservedFieldsDropped identifies legacy data-loss warnings.
+	// Deprecated: preservation limits now refuse the operation without dropping fields.
 	EventReasonPreservedFieldsDropped = "PreservedFieldsDropped"
 )
 
@@ -60,19 +50,32 @@ type Status int
 const (
 	// StatusOK means the file was read and understood.
 	StatusOK Status = iota
-	// StatusAbsent means there is no file. This is a first boot, not a fault:
-	// history was never written, as opposed to lost.
+	// StatusAbsent means no file exists. It cannot distinguish first installation
+	// from lost history; live execution and budget checks are still required.
 	StatusAbsent
-	// StatusRecovered means the file existed but could not be used, so it was
-	// quarantined and a fresh document returned. The caller has lost its
-	// history and should say so — emit an event, and treat any budget it
-	// computes as starting from nothing.
-	StatusRecovered
-	// StatusIncompatible means the file declared a schema version this build
-	// cannot interpret, most likely because a newer agent wrote it and the
-	// node was then downgraded. The bytes are preserved in the quarantine
-	// file; the running agent starts fresh so that it can keep writing.
+	// StatusCorrupt means corrupt history is retained in place.
+	// No automatic repair or quarantine is performed. Ordinary updates are blocked.
+	StatusCorrupt
+	// StatusIncompatible means an unsupported schema is retained unchanged.
 	StatusIncompatible
+	// StatusDurabilityUnknown means the file is visible but synchronization failed.
+	StatusDurabilityUnknown
+	// StatusRecovered means the history is usable but was reconstructed by
+	// ReconcileHistory rather than observed.
+	//
+	// It is a trusted status: ordinary reads and updates proceed. What it
+	// adds is that the records covering this window were supplied by an
+	// operator from authoritative API facts, not accumulated by the agent,
+	// so a reset budget computed from them is only as complete as that
+	// reconstruction was. Report it; do not block on it.
+	//
+	// It clears itself. The status reverts to StatusOK once the
+	// reconciliation falls outside the reboot retention window, because by
+	// then every reconstructed record has aged out and the remaining
+	// history was observed normally. A permanent flag would mark a node
+	// reconstructed for the rest of its life, which is the trap the
+	// completeness horizon already avoids.
+	StatusRecovered
 )
 
 // String implements fmt.Stringer.
@@ -82,67 +85,77 @@ func (s Status) String() string {
 		return "OK"
 	case StatusAbsent:
 		return "Absent"
-	case StatusRecovered:
-		return "Recovered"
+	case StatusCorrupt:
+		return "Corrupt"
 	case StatusIncompatible:
 		return "Incompatible"
+	case StatusDurabilityUnknown:
+		return "DurabilityUnknown"
+	case StatusRecovered:
+		return "Recovered"
 	default:
 		return fmt.Sprintf("Status(%d)", int(s))
 	}
 }
 
-// LoadResult is what Store.Load returns. Document is always usable, whatever
-// the status, so a caller that only wants to get on with its work can ignore
-// everything else — but the start-up classification the design calls for
-// needs all of it.
+// LoadResult contains the classification, which must be checked before use.
+// A placeholder Document in a non-OK result is not trusted execution history.
 type LoadResult struct {
-	// Document is the loaded state, or a fresh one when there was nothing
-	// usable to load. Never nil when Load returns a nil error.
+	// Document is the loaded state when Status is StatusOK, and a placeholder
+	// otherwise. A placeholder is somewhere to write, not history to trust:
+	// treat it as such only after reconciliation.
 	Document *Document
 
-	// Status says where Document came from.
+	// Status says what was found. Branch on it. Every value other than
+	// StatusOK means ordinary mutation must wait, which is what
+	// HistoryUncertain reports.
 	Status Status
 
-	// Cause is why the file could not be used, when Status is StatusRecovered
-	// or StatusIncompatible. Classify it with errors.Is against ErrCorrupt,
-	// ErrSchemaUnsupported, ErrSymlink, ErrNotRegular, ErrInsecurePermissions,
-	// ErrInsecureOwner or ErrTooLarge.
+	// Cause is why the contents could not be used, for StatusCorrupt,
+	// StatusIncompatible and StatusDurabilityUnknown. Classify it with
+	// errors.Is against ErrCorrupt, ErrSchemaUnsupported or
+	// ErrDurabilityUnconfirmed.
 	Cause error
 
-	// QuarantinePath is where the unusable file was moved, when there was one
-	// and the move succeeded.
-	QuarantinePath string
-
-	// QuarantineFailed reports that an unusable file could not be moved
-	// aside, so it is still in place and Document exists only in memory.
-	//
-	// This is a host-path fault — a read-only root filesystem, a wrong
-	// SELinux label, a directory this agent may read but not write — and the
-	// agent will not be able to write its own state either. It can still
-	// run: it simply has no durable memory until the path is fixed. Surface
-	// it, because every reboot budget on this node is now computed from
-	// nothing.
+	// Deprecated: Load no longer moves files, because moving a damaged file
+	// before the fact of the damage is durable opens a window where a crash
+	// leaves neither. Corrupt bytes stay at the live path until
+	// ReconcileHistory replaces them. These fields remain zero.
+	QuarantinePath   string
 	QuarantineFailed bool
+	QuarantineError  error
 
-	// QuarantineError is why the move failed, when QuarantineFailed is set.
-	QuarantineError error
-
-	// ForeignWrite reports that the file was last written by someone other
-	// than this Store, which should be impossible under the single-writer
-	// contract. See Store.Load for what the library does about it.
+	// ForeignWrite reports that another process wrote this file after this
+	// Store had written it, which the single-writer contract forbids.
+	//
+	// It is diagnostic. Nothing is refused on the strength of it: stalling a
+	// fencing agent is worse than overwriting a record that should not
+	// exist, and refusing at start-up would let a predecessor stuck in
+	// uninterruptible sleep keep its replacement from ever running. Raise a
+	// condition on it; do not gate execution on it, and do not treat it as a
+	// substitute for the consumer's host executor lock.
 	ForeignWrite bool
 }
 
-// HistoryLost reports whether the previous contents of the file are no longer
-// available to this caller. It is true for StatusRecovered and
-// StatusIncompatible, and false for a first boot.
-//
-// A caller computing a reboot budget must treat a true result as "the budget
-// restarts from zero, and that fact is worth an event", not as "this node has
-// never rebooted".
+// HistoryLost reports corrupt or incompatible contents. False does not prove
+// complete history: in particular, absence is unknown, not verified first boot.
 func (r *LoadResult) HistoryLost() bool {
-	return r != nil && (r.Status == StatusRecovered || r.Status == StatusIncompatible)
+	return r != nil && (r.Status == StatusCorrupt || r.Status == StatusIncompatible)
 }
+
+// Trusted reports whether history with this status may be acted on.
+//
+// StatusOK and StatusRecovered qualify: the second is reconstructed rather
+// than observed, which is worth reporting but is not a reason to stop. Every
+// other status means the consumer must establish the facts first.
+func (s Status) Trusted() bool { return s == StatusOK || s == StatusRecovered }
+
+// HistoryUncertain reports whether ordinary execution must wait for reconciliation.
+func (r *LoadResult) HistoryUncertain() bool { return r == nil || !r.Status.Trusted() }
+
+// HistoryReconstructed reports that this history was supplied by
+// ReconcileHistory rather than accumulated by the agent. See StatusRecovered.
+func (r *LoadResult) HistoryReconstructed() bool { return r != nil && r.Status == StatusRecovered }
 
 // Clock supplies the current time. Replace it in tests with
 // nodestatetest.FakeClock.
@@ -158,19 +171,23 @@ func (systemClock) Now() time.Time { return time.Now() }
 // SystemClock returns the Clock backed by time.Now.
 func SystemClock() Clock { return systemClock{} }
 
-// Store reads and writes node-local state files on behalf of one component.
+// Store reads and writes one component's node-local file.
 //
-// A Store owns exactly one file, the one named after its component, and will
-// not write any other. That single-writer rule is what makes the atomic
-// replace safe without a lock, and the lock is what the design could not
-// afford: a cross-process lock in the feeding path of a hardware watchdog is
-// a liveness hazard in precisely the storage failure the product exists to
-// handle.
+// Operations on the same path are serialized within this process. They are
+// not serialized across processes, and this package deliberately does not
+// try: a cross-process lock in the feeding path of a hardware watchdog is a
+// liveness hazard in precisely the storage failure the product exists to
+// handle, because a holder stuck in uninterruptible sleep would take the
+// watchdog loop down with it. What makes that safe to omit is the pairing of
+// one writer per file with atomic replacement, so a reader always observes a
+// whole version.
 //
-// A Store is safe for concurrent use. Writes and read-modify-write cycles
-// from one process are serialised internally. Serialising *other* processes
-// is not something a library can do, and is not attempted; see Load for how a
-// foreign write is detected and reported.
+// "One writer" is a contract the consumer keeps, not one this package can
+// enforce. Hold a stable host executor lock before loading mutable state or
+// controlling the watchdog. Keep blocked I/O off the watchdog-feeding path,
+// and allow only one outstanding journal operation; an expired wait does not
+// prove the previous one stopped. Load reports a foreign write when it can
+// see one, which is detection after the fact rather than prevention.
 //
 // Construct one with New.
 type Store struct {
@@ -203,6 +220,21 @@ type Store struct {
 	lastRevision uint64
 	haveWritten  bool
 	swept        bool
+
+	// confirmedRevision is the revision this Store has established as
+	// crash-durable, and confirmedValid says whether it means anything yet.
+	//
+	// They exist to keep durability confirmation off the repeat path. A
+	// process cannot know whether its predecessor's last write survived, so
+	// the first Load of a Store must synchronize. Every Load after that is
+	// looking at bytes this process either wrote and synchronized itself, or
+	// already confirmed — and re-synchronizing them buys nothing while
+	// costing another chance to block in uninterruptible sleep, on a node
+	// whose storage is failing. That is the state this product exists for,
+	// and §5.6 of the design asks for journal I/O to be bounded because of
+	// it.
+	confirmedRevision uint64
+	confirmedValid    bool
 }
 
 // fileLocks maps a state file path to the mutex serialising access to it
@@ -365,8 +397,8 @@ func WithMaxDocumentBytes(n int) Option {
 }
 
 // WithMaxReadBytes caps how much of a file the Store will read into memory.
-// A larger file reads as unusable: quarantined for the owner, absent for a
-// peer.
+// A larger file returns ErrTooLarge for the owner and PeerUnreadable for a
+// peer. Its contents remain unchanged.
 func WithMaxReadBytes(n int) Option {
 	return func(c *config) error {
 		if n <= 0 {
@@ -505,6 +537,12 @@ func (s *Store) ensureDirectory() error {
 		return pathErrorf("lstat", s.dir, err)
 	}
 
+	if err := s.checkResolvedPath(); err != nil {
+		return err
+	}
+	// Note which components are about to be created, so only those get
+	// synchronized afterwards.
+	created := s.missingAncestors()
 	if err := s.fs.MkdirAll(s.dir, s.security.DirMode); err != nil {
 		return pathErrorf("mkdir", s.dir, err)
 	}
@@ -524,6 +562,24 @@ func (s *Store) ensureDirectory() error {
 	}
 	if err := s.security.checkDirectory(s.dir, fi); err != nil {
 		return err
+	}
+
+	// A newly created directory needs its name persisted in its parent, or a
+	// power loss can leave the directory entry behind and the journal with
+	// nowhere to live.
+	//
+	// Only the parents of directories this call actually created are
+	// synchronized. Walking all the way to the root instead would fsync
+	// /var, / and whatever else is above the state directory — paths this
+	// agent did not touch and does not own. That is wasted I/O on the
+	// start-up path, and on a node with failing storage every extra fsync is
+	// another chance to block; a failure on one of them would stop the agent
+	// starting at all, over a directory it never modified.
+	for _, dir := range created {
+		parent := filepath.Dir(dir)
+		if err := s.fs.SyncDir(parent); err != nil {
+			return pathErrorf("fsync", parent, err)
+		}
 	}
 
 	// MkdirAll applies the process umask, so the directory may be more
@@ -566,150 +622,159 @@ func (s *Store) checkResolvedPath() error {
 	if s.security.AllowSymlinks {
 		return nil
 	}
-	resolved, err := filepath.EvalSymlinks(s.dir)
-	if err != nil {
-		// Nothing to compare against. Any real problem with the path shows
-		// up in the Lstat and open checks that follow.
-		return nil
+	for path := s.dir; ; path = filepath.Dir(path) {
+		fi, err := s.fs.Lstat(path)
+		if err != nil && !errors.Is(err, fs.ErrNotExist) {
+			return pathErrorf("lstat", path, err)
+		}
+		if err == nil && fi.Mode()&os.ModeSymlink != 0 {
+			return pathErrorf("verify", path, ErrSymlink)
+		}
+		if filepath.Dir(path) == path {
+			return nil
+		}
 	}
-	if resolved == s.dir {
-		return nil
-	}
-	return pathErrorf("verify", s.dir, fmt.Errorf(
-		"%w: the path resolves to %s, so a link somewhere above it is redirecting this directory",
-		ErrSymlink, resolved))
 }
 
-// Load reads this Store's own file and classifies what it found.
-//
-// Load always returns a usable Document unless it returns an error, and it
-// returns an error only for a condition the caller cannot work around: a
-// cancelled context, or a state directory that violates the security policy.
-// Everything about the file's *contents* is handled here:
-//
-//   - no file: StatusAbsent and a fresh document;
-//   - unreadable or unparseable: the file is quarantined with its bytes
-//     intact, and StatusRecovered is returned with a fresh document;
-//   - a schema version this build does not support: quarantined likewise,
-//     StatusIncompatible;
-//   - unusable and unmovable, because the host path cannot be written: still
-//     StatusRecovered with a fresh in-memory document, and
-//     QuarantineFailed set. The agent gets to run and classify its start-up
-//     rather than failing to start at all.
-//
-// Quarantining is a write, and a Store only writes its own file. A peer's
-// damaged file is never touched — see ReadPeer.
-//
-// Load also reports a foreign write. Document.WriterID identifies the
-// process that last wrote the file — boot id, process id and start time —
-// so finding another one means a second process is writing a file this one
-// owns, which the single-writer contract forbids.
-//
-// It is reported in LoadResult.ForeignWrite and nothing else happens. The
-// library never refuses to write on the strength of it: stalling a fencing
-// agent is worse than overwriting a record that should not exist, and a
-// refusal at start-up would let a predecessor stuck in uninterruptible sleep
-// keep its replacement from ever starting. Raise a condition on it; do not
-// gate anything on it.
+// missingAncestors returns the directories MkdirAll will have to create, from
+// the shallowest to the deepest. An unreadable ancestor stops the walk: the
+// subsequent MkdirAll reports that failure with better context than a guess
+// made here would.
+func (s *Store) missingAncestors() []string {
+	var missing []string
+	for path := s.dir; ; path = filepath.Dir(path) {
+		if _, err := s.fs.Lstat(path); err == nil {
+			break
+		} else if !errors.Is(err, fs.ErrNotExist) {
+			break
+		}
+		missing = append(missing, path)
+		if filepath.Dir(path) == path {
+			break
+		}
+	}
+	// Reverse: a parent must be durable before the child that names it.
+	for i, j := 0, len(missing)-1; i < j; i, j = i+1, j-1 {
+		missing[i], missing[j] = missing[j], missing[i]
+	}
+	return missing
+}
+
+// Load classifies the owner's current history without discarding any bytes.
+// Absent is not proof of first installation: the caller must check live execution,
+// budgets and its deployment history before deliberately initializing with Write.
+// Corrupt and incompatible files remain at their original path until an explicit
+// ReconcileHistory, so uncertainty survives process restart and housekeeping.
+// Before returning StatusOK, Load synchronizes the existing file and directory.
+// This also resolves an earlier visible but durability-unconfirmed replacement.
+// A readback alone is never a durability confirmation.
 func (s *Store) Load(ctx context.Context) (*LoadResult, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.loadLocked()
+	res, err := s.loadLocked()
+	if err != nil {
+		return res, err
+	}
+	if res.Status.Trusted() {
+		if err := s.confirmLocked(res.Document); err != nil {
+			res.Status, res.Cause = StatusDurabilityUnknown, err
+			return res, err
+		}
+	}
+	return res, nil
 }
 
-// Read is Load without the classification, for a caller that only wants the
-// current contents.
+// confirmLocked establishes that doc is crash-durable, skipping the work when
+// this Store has already established it for the same revision.
 //
-// Do not use it for the start-up path. Read cannot distinguish "this node has
-// never rebooted" from "the history was unusable and has just been thrown
-// away", and those lead to opposite decisions about a reboot budget. Use Load
-// there and inspect LoadResult.HistoryLost. The recovery is also recorded as
-// an EventReasonStateFileRecovered entry in the returned document, so it is
-// not invisible — but a status code is the thing to branch on.
+// Skipping is safe because there are only two ways the live file can reach a
+// revision this Store has confirmed: this process synchronized it here, or
+// this process wrote it through atomicReplace, which synchronizes the file
+// and the directory before returning success. A write that could not be
+// confirmed clears the mark, and so does any revision this Store has not
+// seen — including every revision left behind by a previous process.
+//
+// The caller holds mu.
+func (s *Store) confirmLocked(doc *Document) error {
+	if s.confirmedValid && doc != nil && doc.Revision == s.confirmedRevision {
+		return nil
+	}
+	if err := s.syncCurrent(); err != nil {
+		s.confirmedValid = false
+		return err
+	}
+	if doc != nil {
+		s.confirmedRevision, s.confirmedValid = doc.Revision, true
+	}
+	return nil
+}
+
+// Read returns trusted current history, or an error.
+//
+// It fails closed. Anything other than StatusOK — absent, corrupt,
+// incompatible, durability unknown — comes back as ErrHistoryUnknown rather
+// than as an empty document, because "this node has never run" and "the
+// history is gone" lead to opposite decisions about a reset budget and must
+// never be confused.
+//
+// Use Load at start-up, where the distinction between those cases is the
+// whole question. Use Read once history is known good.
 func (s *Store) Read(ctx context.Context) (*Document, error) {
 	res, err := s.Load(ctx)
 	if err != nil {
 		return nil, err
 	}
+	if !res.Status.Trusted() {
+		return nil, historyError(res)
+	}
 	return res.Document, nil
 }
 
+func historyError(res *LoadResult) error {
+	if res.Cause != nil {
+		return fmt.Errorf("%w: %s: %w", ErrHistoryUnknown, res.Status, res.Cause)
+	}
+	return fmt.Errorf("%w: %s; reconcile or explicitly initialize before updating", ErrHistoryUnknown, res.Status)
+}
+
 func (s *Store) loadLocked() (*LoadResult, error) {
-	// A directory that is absent is a first boot; one that exists but is
-	// insecure is a fault the caller has to know about, because nothing read
-	// from inside it can be trusted.
 	if err := s.verifyDirectoryIfPresent(); err != nil {
 		return nil, err
 	}
-
-	path := s.Path(s.self)
-	doc, err := s.readDocument(path, s.self)
+	doc, err := s.readDocument(s.Path(s.self), s.self)
 	switch {
 	case err == nil:
-		res := &LoadResult{Document: doc, Status: StatusOK}
-		res.ForeignWrite = s.isForeign(doc)
-		s.capPreserved(doc)
-		return res, nil
-
+		if err := s.checkPreserved(doc); err != nil {
+			return nil, err
+		}
+		return &LoadResult{Document: doc, Status: s.classify(doc), ForeignWrite: s.isForeign(doc)}, nil
 	case errors.Is(err, fs.ErrNotExist):
 		return &LoadResult{Document: s.newDocument(), Status: StatusAbsent}, nil
+	case errors.Is(err, ErrCorrupt), errors.Is(err, ErrSchemaUnsupported):
+		status := StatusCorrupt
+		if errors.Is(err, ErrSchemaUnsupported) {
+			status = StatusIncompatible
+		}
+		return &LoadResult{Document: s.newDocument(), Status: status, Cause: err}, nil
+	default:
+		// Access and I/O failures are not evidence of corrupt contents.
+		return nil, err
 	}
-
-	status := StatusRecovered
-	if errors.Is(err, ErrSchemaUnsupported) {
-		status = StatusIncompatible
-	}
-
-	// The file cannot be used. Move it aside, preserving its bytes, and start
-	// fresh.
-	//
-	// When even that fails — a read-only root filesystem, a wrong SELinux
-	// label, a directory the agent may read but not write — the caller still
-	// gets a usable document. It was going to start from nothing either way,
-	// and refusing to hand it one only means the agent cannot classify its
-	// start-up or run at all. The flag tells it that what it is holding is
-	// in memory and that the damaged file is still in place underneath.
-	quarantined, qerr := s.quarantine(path)
-
-	// Record the loss in the fresh document as well as in the result.
-	//
-	// The result is the structured signal, and a caller classifying its
-	// start-up will act on it. But Read and Update return only the document,
-	// and recovery can happen on any call, not just the first — so without
-	// this, an agent that only ever calls Update would lose its history with
-	// nothing anywhere to say so. The event ring is the file's own record of
-	// what happened to it, which is exactly what a post-mortem reads.
-	fresh := s.newDocument()
-	message := fmt.Sprintf("the previous state file was unusable and was quarantined at %s; "+
-		"history before this point is lost: %v", filepath.Base(quarantined), err)
-	if qerr != nil {
-		message = fmt.Sprintf("the previous state file is unusable and could not be moved aside (%v); "+
-			"history before this point is lost and this document is in memory only: %v", qerr, err)
-	}
-	fresh.AppendEvent(EventEntry{
-		TS:      s.clock.Now(),
-		Type:    "Warning",
-		Reason:  EventReasonStateFileRecovered,
-		Message: message,
-	})
-
-	return &LoadResult{
-		Document:         fresh,
-		Status:           status,
-		Cause:            err,
-		QuarantinePath:   quarantined,
-		QuarantineFailed: qerr != nil,
-		QuarantineError:  qerr,
-	}, nil
 }
 
-// verifyDirectoryIfPresent checks the state directory, treating its absence
-// as acceptable.
+// verifyDirectoryIfPresent checks every read path, without creating directories.
 func (s *Store) verifyDirectoryIfPresent() error {
-	fi, err := s.fs.Lstat(s.dir)
+	if err := s.checkResolvedPath(); err != nil {
+		return err
+	}
+	stat := s.fs.Lstat
+	if s.security.AllowSymlinks {
+		stat = s.fs.Stat
+	}
+	fi, err := stat(s.dir)
 	if errors.Is(err, fs.ErrNotExist) {
 		return nil
 	}
@@ -719,50 +784,41 @@ func (s *Store) verifyDirectoryIfPresent() error {
 	return s.security.checkDirectory(s.dir, fi)
 }
 
-// capPreserved enforces the ceiling on unrecognised members carried forward
-// from a newer peer.
-//
-// The ceiling matters because preservation is unconditional and the document
-// has a write limit. A newer peer adding a handful of fields costs a few
-// hundred bytes and is exactly what the mechanism is for. A file containing
-// a megabyte of unrecognised members — whether a peer with a bug or a
-// workload with write access to the directory — would be read, carried, and
-// then refused by the write limit, leaving this agent unable to record
-// anything for as long as that file sat there. Dropping is the lesser loss:
-// preservation is a courtesy to a peer, and writing is this agent's job.
-//
-// All of them go, rather than an arbitrary subset, so the outcome does not
-// depend on map iteration order.
-func (s *Store) capPreserved(doc *Document) {
-	if s.housekeeping.MaxPreservedBytes <= 0 {
-		return
+// Refuse writes we cannot preserve; never silently discard newer fields.
+func (s *Store) checkPreserved(doc *Document) error {
+	if s.housekeeping.MaxPreservedBytes > 0 && doc.preservedBytes() > s.housekeeping.MaxPreservedBytes {
+		return fmt.Errorf("%w: preserved fields exceed %d bytes; original history is unchanged", ErrTooLarge, s.housekeeping.MaxPreservedBytes)
 	}
-	total := doc.preservedBytes()
-	if total <= s.housekeeping.MaxPreservedBytes {
-		return
+	return nil
+}
+
+// classify separates history the agent accumulated from history an operator
+// reconstructed, for as long as that distinction still describes the records
+// a budget would be computed from.
+func (s *Store) classify(doc *Document) Status {
+	if doc == nil || doc.HistoryReconciledAt.IsZero() {
+		return StatusOK
 	}
-	doc.dropPreserved()
-	doc.AppendEvent(EventEntry{
-		TS:     s.clock.Now(),
-		Type:   "Warning",
-		Reason: EventReasonPreservedFieldsDropped,
-		Message: fmt.Sprintf("dropped %d bytes of members written by a newer peer, over the %d byte limit; "+
-			"a staggered upgrade will not carry that peer's data through this agent", total, s.housekeeping.MaxPreservedBytes),
-	})
+	window := s.retention.RebootMaxAge
+	if window <= 0 {
+		// Records never age out, so the reconstruction never stops
+		// describing them.
+		return StatusRecovered
+	}
+	if s.clock.Now().Sub(doc.HistoryReconciledAt) < window {
+		return StatusRecovered
+	}
+	return StatusOK
 }
 
 func (s *Store) isForeign(doc *Document) bool {
 	if !s.haveWritten {
-		// Nothing written yet, so there is nothing to contradict. A file left
-		// by a previous run of this same agent is the normal case.
 		return false
 	}
 	return doc.WriterID != s.writerID || doc.Revision < s.lastRevision
 }
 
-func (s *Store) newDocument() *Document {
-	return NewDocument(s.self)
-}
+func (s *Store) newDocument() *Document { return NewDocument(s.self) }
 
 // ReadPeer reads another component's file.
 //
@@ -778,7 +834,7 @@ func (s *Store) newDocument() *Document {
 // name — or a cancelled context.
 //
 // ReadPeer never writes. A peer's damaged file is left exactly as found, for
-// its owner to quarantine.
+// explicit consumer reconciliation.
 //
 // Passing this Store's own component is allowed and reads the Store's own
 // file with the same tolerance — no quarantine, no classification. That is
@@ -798,9 +854,8 @@ type PeerStatus int
 const (
 	// PeerOK means the document was read.
 	PeerOK PeerStatus = iota
-	// PeerAbsent means there is no file. The peer has not run on this node,
-	// or has not written yet. This is the ordinary case on a node where only
-	// one agent is deployed, and is not worth reporting.
+	// PeerAbsent means no file exists. It does not distinguish an optional
+	// peer that never ran from a peer whose history was lost.
 	PeerAbsent
 	// PeerUnusable means the file exists but its contents could not be used:
 	// empty, truncated, not a document, or claiming another owner. That is
@@ -914,20 +969,20 @@ func isAccessFault(err error) bool {
 }
 
 // ReadAll reads several components' files and returns the ones that could be
-// read, keyed by component. With no components named it reads
-// KnownComponents.
+// read, keyed by component. With no components named it reads only this Store's
+// own file. Pass an explicit set for deliberate multi-component diagnostics.
 //
 // Nothing is written, including for this Store's own file: ReadAll is a
 // read-only view and does not quarantine. Use it to assemble the inputs to
 // MergeReboots:
 //
-//	docs := store.ReadAll(ctx)
+//	docs := store.ReadAll(ctx, nodestate.ComponentSBR, nodestate.ComponentSNR)
 //	reboots := nodestate.MergeReboots(docs[nodestate.ComponentSBR], docs[nodestate.ComponentSNR])
 //
 // An unreadable file is simply absent from the result. There is no error
 // return by design: every failure mode here is one the caller must carry on
 // through. Use LoadPeer when you need to know *why* a peer is missing — in
-// particular to tell "has never run" from "is there and I may not read it",
+// particular to distinguish absence (which may mean lost history) from denial,
 // which is a deployment fault that silently drops that peer's history out of
 // every budget merged here.
 func (s *Store) ReadAll(ctx context.Context, components ...Component) map[Component]*Document {
@@ -936,10 +991,7 @@ func (s *Store) ReadAll(ctx context.Context, components ...Component) map[Compon
 		return out
 	}
 	if len(components) == 0 {
-		components = KnownComponents()
-		if !containsComponent(components, s.self) {
-			components = append(components, s.self)
-		}
+		components = []Component{s.self}
 	}
 	seen := make(map[Component]struct{}, len(components))
 	for _, c := range components {
@@ -959,37 +1011,17 @@ func (s *Store) ReadAll(ctx context.Context, components ...Component) map[Compon
 	return out
 }
 
-func containsComponent(list []Component, want Component) bool {
-	for _, c := range list {
-		if c == want {
-			return true
-		}
-	}
-	return false
-}
-
-// Write replaces this Store's file with doc.
+// Write deliberately replaces a valid document, or initializes an absent file.
+// Before initializing, the consumer must independently establish that no live
+// unresolved execution exists and that its budget is known. File
+// absence alone is insufficient. Use Update for normal state transitions;
+// corrupt/unsupported history requires explicit ReconcileHistory.
 //
-// The replacement is atomic for any reader: the bytes are written to a
-// temporary file in the same directory, flushed, renamed over the target, and
-// the directory entry is flushed in turn. A concurrent reader sees either the
-// whole previous version or the whole new one, never a mixture and never an
-// empty file. A failure at any step leaves the previous version in place.
-//
-// Write stamps SchemaVersion, Agent.Component, UpdatedAt, WriterID and
-// Revision on doc, so the caller's copy reflects what was written.
-//
-// Write does not apply the retention policy — it writes what it is given, and
-// fails with ErrTooLarge if that exceeds the configured size. Prefer Update,
-// which loads, mutates, trims and writes in one serialised step.
-//
-// One error does not mean the write was lost. ErrDurabilityUnconfirmed says
-// the replacement is already visible and only its survival across a power
-// loss is unproven; treat the document as written. Every other error means
-// the previous version is still in place and nothing changed. A caller that
-// gates an action on the record reaching disk — recording a pending fence
-// before issuing it — must distinguish the two, or it will withhold a fence
-// whose record is already there.
+// Write stamps metadata on doc and performs temp-write, file sync, rename and
+// directory sync. Only nil error confirms durability. ErrDurabilityUnconfirmed
+// means the candidate is visible but MUST NOT authorize a new reset; resolve
+// that exact candidate with ConfirmDurability without repeating the mutation.
+// Other errors leave the previous live file unchanged. Write does not prune.
 func (s *Store) Write(ctx context.Context, doc *Document) error {
 	return s.WriteTo(ctx, s.self, doc)
 }
@@ -1022,10 +1054,20 @@ func (s *Store) WriteTo(ctx context.Context, c Component, doc *Document) error {
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	res, err := s.loadLocked()
+	if err != nil {
+		return err
+	}
+	if !res.Status.Trusted() && res.Status != StatusAbsent {
+		return historyError(res)
+	}
 	return s.writeLocked(doc)
 }
 
 func (s *Store) writeLocked(doc *Document) error {
+	if err := s.checkPreserved(doc); err != nil {
+		return err
+	}
 	identity := processIdentity()
 	doc.SchemaVersion = Schema
 	doc.Agent.Component = s.self
@@ -1070,6 +1112,13 @@ func (s *Store) writeLocked(doc *Document) error {
 	// detection reads.
 	s.lastRevision = doc.Revision
 	s.haveWritten = true
+	if err == nil {
+		// atomicReplace synchronized the file and the directory before
+		// returning, so these bytes are durable without another pass.
+		s.confirmedRevision, s.confirmedValid = doc.Revision, true
+	} else {
+		s.confirmedValid = false
+	}
 	return err
 }
 
@@ -1095,37 +1144,17 @@ func encodeDocument(doc *Document) ([]byte, error) {
 	return append(encoded, '\n'), nil
 }
 
-// Update performs a serialised read-modify-write cycle on this Store's file.
+// Update serializes loading, durability confirmation, mutation, retention and
+// replacement. Absent, corrupt, unsupported or unreadable history prevents the
+// callback from running. Initialize deliberately with Write only after verifying
+// first-installation prerequisites, or use ReconcileHistory for resolved history.
 //
-// This is the method to use. It loads the current document — recovering from
-// a damaged file exactly as Load does — passes it to mutate, applies the
-// retention policy, and writes the result. The whole cycle holds the Store's
-// lock, so concurrent callers in one process cannot lose each other's
-// changes.
-//
-// The mutator may return ErrNoChange to skip the write; Update then returns
-// the unmodified document and a nil error. Any other error from the mutator
-// aborts the cycle with nothing written, so a caller that discovers mid-way
-// that it should not proceed can say so without leaving a half-applied
-// document behind.
-//
-// The returned document is the one that was written, including the stamped
-// revision and timestamp. It is the Store's own copy; Clone it before handing
-// it to another goroutine.
-//
-// The mutator runs while the Store's lock is held. Keep it short, and do not
-// call back into this Store from it — that deadlocks. In particular, read a
-// peer's file before entering Update, not inside it.
-//
-// Like Read, Update recovers a damaged file silently and returns only the
-// document, so it is not the call to classify a start-up with. When it does
-// recover, the mutator sees a fresh document already carrying an
-// EventReasonStateFileRecovered entry, which is both the signal and the
-// durable record.
-//
-// Update returns a non-nil document together with ErrDurabilityUnconfirmed:
-// that write is visible and only its durability is in doubt. For every other
-// error the document is nil and nothing was written. See Write.
+// The callback runs under the per-path mutex; do not call this Store from it.
+// ErrNoChange skips replacement. Any other callback error aborts the mutation.
+// A non-nil document with ErrDurabilityUnconfirmed identifies the visible
+// candidate, not permission to reset. Use ConfirmDurability to resolve it. If
+// confirmation of the existing file failed before mutation, the document is nil.
+// All other errors return nil document and leave live content unchanged.
 func (s *Store) Update(ctx context.Context, mutate func(*Document) error) (*Document, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
@@ -1141,6 +1170,14 @@ func (s *Store) Update(ctx context.Context, mutate func(*Document) error) (*Docu
 	if err != nil {
 		return nil, err
 	}
+	if !res.Status.Trusted() {
+		return nil, historyError(res)
+	}
+	// Confirm the predecessor is durable before building on it. Cached, so
+	// a steady stream of updates pays for one confirmation, not one per call.
+	if err := s.confirmLocked(res.Document); err != nil {
+		return nil, err
+	}
 	doc := res.Document
 	if err := mutate(doc); err != nil {
 		if errors.Is(err, ErrNoChange) {
@@ -1153,7 +1190,7 @@ func (s *Store) Update(ctx context.Context, mutate func(*Document) error) (*Docu
 	if err := s.writeLocked(doc); err != nil {
 		if errors.Is(err, ErrDurabilityUnconfirmed) {
 			// Written and visible. Hand back the document as well as the
-			// error so the caller can act on what it recorded.
+			// error so the caller can confirm this candidate without rerunning mutate.
 			return doc, err
 		}
 		return nil, err

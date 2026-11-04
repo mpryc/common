@@ -55,12 +55,12 @@ func TestSnapshot_UnreadablePeerMakesTheHistoryIncomplete(t *testing.T) {
 
 	// The old composition still behaves as it did, and that is the point:
 	// it cannot know a file is missing.
-	docs := s.ReadAll(ctx)
+	docs := s.ReadAll(ctx, nodestate.ComponentSBR, nodestate.ComponentSNR)
 	if !nodestate.RebootHistoryComplete(window, docs[nodestate.ComponentSBR], docs[nodestate.ComponentSNR]) {
 		t.Fatal("setup is wrong; the primitives are expected to miss this")
 	}
 
-	snap := s.Snapshot(ctx)
+	snap := s.Snapshot(ctx, nodestate.ComponentSBR, nodestate.ComponentSNR)
 	if snap.HistoryComplete(window) {
 		t.Error("HistoryComplete = true with an unreadable peer holding a reboot record")
 	}
@@ -82,7 +82,7 @@ func TestSnapshot_CompleteWhenEverythingReads(t *testing.T) {
 	ctx := context.Background()
 	now := time.Now()
 
-	ref := &nodestate.CRRef{UID: "uid-1", Generation: 1}
+	ref := &nodestate.CRRef{NodeUID: "node-uid", UID: "uid-1", Generation: 1}
 	writePeerDoc(t, dir, nodestate.ComponentSBR, func(d *nodestate.Document) {
 		d.AppendReboot(nodestate.RebootEntry{
 			TS: now.Add(-time.Hour), Source: nodestate.ComponentSBR,
@@ -97,7 +97,7 @@ func TestSnapshot_CompleteWhenEverythingReads(t *testing.T) {
 		d.AppendReboot(nodestate.RebootEntry{TS: now.Add(-3 * time.Hour), Reason: "TotalOutage"})
 	})
 
-	snap := s.Snapshot(ctx)
+	snap := s.Snapshot(ctx, nodestate.ComponentSBR, nodestate.ComponentSNR)
 	window := now.Add(-24 * time.Hour)
 
 	if !snap.HistoryComplete(window) {
@@ -119,7 +119,7 @@ func TestSnapshot_CompleteWhenEverythingReads(t *testing.T) {
 	}
 }
 
-func TestSnapshot_AbsentPeerIsNotIncomplete(t *testing.T) {
+func TestSnapshot_AbsentPeerIsIncomplete(t *testing.T) {
 	t.Parallel()
 
 	s, dir := newStore(t, nodestate.ComponentSBR)
@@ -127,12 +127,12 @@ func TestSnapshot_AbsentPeerIsNotIncomplete(t *testing.T) {
 
 	writePeerDoc(t, dir, nodestate.ComponentSBR, func(d *nodestate.Document) {})
 
-	snap := s.Snapshot(ctx)
-	if !snap.HistoryComplete(time.Now().Add(-time.Hour)) {
-		t.Error("a peer that never ran made the history incomplete; it has no records to be missing")
+	snap := s.Snapshot(ctx, nodestate.ComponentSBR, nodestate.ComponentSNR)
+	if snap.HistoryComplete(time.Now().Add(-time.Hour)) {
+		t.Error("an absent peer may have lost history")
 	}
-	if got := snap.Missing(); len(got) != 0 {
-		t.Errorf("Missing() = %v, want empty", got)
+	if got := snap.Missing(); len(got) != 1 {
+		t.Errorf("Missing() = %v, want the absent peer", got)
 	}
 	if snap.Peers[nodestate.ComponentSNR].Status != nodestate.PeerAbsent {
 		t.Errorf("snr status = %v, want PeerAbsent", snap.Peers[nodestate.ComponentSNR].Status)
@@ -148,7 +148,7 @@ func TestSnapshot_NewerSchemaPeerMakesTheHistoryIncomplete(t *testing.T) {
 	writePeerDoc(t, dir, nodestate.ComponentSBR, func(d *nodestate.Document) {})
 	mustWrite(t, filepath.Join(dir, nodestate.SNRFile), `{"schemaVersion":99,"agent":{"component":"snr"}}`)
 
-	snap := s.Snapshot(ctx)
+	snap := s.Snapshot(ctx, nodestate.ComponentSBR, nodestate.ComponentSNR)
 	if snap.HistoryComplete(time.Now().Add(-time.Hour)) {
 		t.Error("HistoryComplete = true with a peer this build cannot interpret")
 	}
@@ -172,7 +172,7 @@ func TestSnapshot_HorizonStillCounts(t *testing.T) {
 		d.RebootHistoryCompleteSince = now.Add(-2 * time.Hour)
 	})
 
-	snap := s.Snapshot(ctx)
+	snap := s.Snapshot(ctx, nodestate.ComponentSBR)
 	if snap.HistoryComplete(now.Add(-24 * time.Hour)) {
 		t.Error("a window reaching past a document's own horizon reported complete")
 	}
@@ -218,7 +218,7 @@ func TestSnapshot_NilAndCancelled(t *testing.T) {
 	s, _ := newStore(t, nodestate.ComponentSBR)
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	if got := s.Snapshot(ctx); len(got.Peers) != 0 {
+	if got := s.Snapshot(ctx, nodestate.ComponentSBR, nodestate.ComponentSNR); got.HistoryComplete(time.Now()) || got.Err == nil || len(got.Missing()) != 2 {
 		t.Errorf("Snapshot on a cancelled context read %d components", len(got.Peers))
 	}
 }

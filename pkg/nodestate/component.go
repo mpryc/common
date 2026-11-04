@@ -6,14 +6,15 @@ import "fmt"
 // name of that writer's file inside the state directory, so it is constrained
 // to a conservative character set: a component name can never be a path.
 //
-// Two components are defined by the medik8s contract. Any other operator that
-// wants node-local state may define its own, provided the name validates.
+// Named constants are conveniences, not an installed-component registry. Any
+// controller may define its own component, provided the name validates.
 type Component string
 
 const (
 	// ComponentSBR is the storage-based-remediation agent.
 	ComponentSBR Component = "sbr"
-	// ComponentSNR is the self-node-remediation agent.
+	// ComponentSNR names a potential self-node-remediation consumer.
+	// Its presence does not require SNR to use this package or create a file.
 	ComponentSNR Component = "snr"
 )
 
@@ -59,11 +60,10 @@ func (c Component) String() string { return string(c) }
 // is only meaningful for a component that passes Validate.
 func (c Component) FileName() string { return string(c) + FileExtension }
 
-// KnownComponents returns the components defined by the medik8s contract, in a
-// stable order. It is the default set Store.ReadAll consults.
-//
-// A caller with a component of its own should pass its full set to ReadAll
-// explicitly rather than relying on this.
+// KnownComponents returns the built-in component names in stable order.
+// It does not describe what is installed or which histories a caller requires.
+// ReadAll and Snapshot default to the owning component, not this catalog.
+// Pass an explicitly selected set to read multiple components.
 func KnownComponents() []Component {
 	return []Component{ComponentSBR, ComponentSNR}
 }

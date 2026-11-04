@@ -35,15 +35,9 @@ func TestLoad_FileThatGrowsBetweenStatAndReadIsRefused(t *testing.T) {
 	// it. The limit must still be enforced on the bytes actually read.
 	mustWrite(t, path, strings.Repeat("x", 1024))
 
-	res, err := s.Load(context.Background())
-	if err != nil {
-		t.Fatalf("Load: %v", err)
-	}
-	if res.Status != nodestate.StatusRecovered {
-		t.Fatalf("Status = %v, want StatusRecovered", res.Status)
-	}
-	if !errors.Is(res.Cause, nodestate.ErrTooLarge) {
-		t.Errorf("Cause = %v, want ErrTooLarge", res.Cause)
+	_, err = s.Load(context.Background())
+	if !errors.Is(err, nodestate.ErrTooLarge) {
+		t.Fatal(err)
 	}
 }
 
@@ -98,7 +92,7 @@ func TestLoad_FileRemovedBetweenStatAndOpenReadsAsAbsent(t *testing.T) {
 	}
 }
 
-// TestLoad_UnquarantinableFileStillYieldsADocument covers the read-only root
+// TestLoad_DoesNotAttemptQuarantineOnReadOnlyStorage covers the read-only root
 // filesystem, the wrong SELinux label, and the directory the agent may read
 // but not write.
 //
@@ -107,72 +101,19 @@ func TestLoad_FileRemovedBetweenStatAndOpenReadsAsAbsent(t *testing.T) {
 // for a document it was going to start from nothing anyway. It gets one, in
 // memory, with the fault reported — and the damaged file is left exactly
 // where it was.
-func TestLoad_UnquarantinableFileStillYieldsADocument(t *testing.T) {
-	t.Parallel()
-
-	dir := tempStateDir(t)
+func TestLoad_DoesNotAttemptQuarantineOnReadOnlyStorage(t *testing.T) {
+	faulty := nodestatetest.NewFaultyFS(nodestate.OSFileSystem())
+	s, dir := newStore(t, nodestate.ComponentSBR, nodestate.WithFileSystem(faulty))
 	path := filepath.Join(dir, nodestate.SBRFile)
-	mustWrite(t, path, "{corrupt")
-
-	readOnly := errors.New("EROFS")
-	stuck := nodestatetest.NewFaultyFS(nodestate.OSFileSystem())
-	stuck.FailAlways(nodestatetest.OpRename, readOnly)
-
-	s, err := nodestate.New(nodestate.ComponentSBR,
-		nodestate.WithDir(dir), nodestate.WithFileSystem(stuck))
-	if err != nil {
-		t.Fatal(err)
-	}
-
+	mustWrite(t, path, "{bad")
+	faulty.FailAlways(nodestatetest.OpRename, errors.New("read-only"))
 	res, err := s.Load(context.Background())
-	if err != nil {
-		t.Fatalf("Load: %v, want a usable result", err)
+	if err != nil || res.Status != nodestate.StatusCorrupt || res.QuarantineFailed {
+		t.Fatalf("%+v %v", res, err)
 	}
-	if res.Document == nil {
-		t.Fatal("Document is nil; the agent cannot start")
-	}
-	if res.Status != nodestate.StatusRecovered {
-		t.Errorf("Status = %v, want StatusRecovered", res.Status)
-	}
-	if !res.HistoryLost() {
-		t.Error("HistoryLost() = false")
-	}
-	if !res.QuarantineFailed {
-		t.Error("QuarantineFailed = false; the caller cannot tell its state is in memory only")
-	}
-	if !errors.Is(res.QuarantineError, readOnly) {
-		t.Errorf("QuarantineError = %v, want the underlying cause", res.QuarantineError)
-	}
-	if res.QuarantinePath != "" {
-		t.Errorf("QuarantinePath = %q, want empty: nothing was moved", res.QuarantinePath)
-	}
-	if !errors.Is(res.Cause, nodestate.ErrCorrupt) {
-		t.Errorf("Cause = %v, want ErrCorrupt: why the file was unusable in the first place", res.Cause)
-	}
-
-	// The half of the old contract that still holds: the evidence stays.
-	got, err := os.ReadFile(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if string(got) != "{corrupt" {
-		t.Errorf("the evidence was destroyed: %q", got)
-	}
-
-	// And the recovery event says the document is in memory only, so an
-	// operator reading a log line knows the budget is being computed from
-	// nothing.
-	var found bool
-	for _, e := range res.Document.Events {
-		if e.Reason == nodestate.EventReasonStateFileRecovered {
-			found = true
-			if !strings.Contains(e.Message, "in memory only") {
-				t.Errorf("event message does not say the state is in memory only: %q", e.Message)
-			}
-		}
-	}
-	if !found {
-		t.Error("no recovery event")
+	raw, _ := os.ReadFile(path)
+	if string(raw) != "{bad" {
+		t.Fatal("bytes changed")
 	}
 }
 
@@ -180,38 +121,17 @@ func TestLoad_UnquarantinableFileStillYieldsADocument(t *testing.T) {
 // same fault: the agent starts, classifies, and keeps working without ever
 // persisting anything.
 func TestLoad_RunningDegradedOnAReadOnlyHostPath(t *testing.T) {
-	t.Parallel()
-
-	dir := tempStateDir(t)
-	mustWrite(t, filepath.Join(dir, nodestate.SBRFile), "{corrupt")
-	if err := os.Chmod(dir, 0o500); err != nil {
+	faulty := nodestatetest.NewFaultyFS(nodestate.OSFileSystem())
+	s, dir := newStore(t, nodestate.ComponentSBR, nodestate.WithFileSystem(faulty))
+	mustWrite(t, filepath.Join(dir, nodestate.SBRFile), "{bad")
+	faulty.FailAlways(nodestatetest.OpWrite, errors.New("read-only"))
+	res, err := s.Load(context.Background())
+	if err != nil || res.Status != nodestate.StatusCorrupt {
+		t.Fatalf("%+v %v", res, err)
+	}
+	_, err = s.Update(context.Background(), func(d *nodestate.Document) error { t.Fatal("unknown history mutated"); return nil })
+	if !errors.Is(err, nodestate.ErrHistoryUnknown) {
 		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = os.Chmod(dir, 0o700) })
-
-	s, err := nodestate.New(nodestate.ComponentSBR, nodestate.WithDir(dir))
-	if err != nil {
-		t.Fatal(err)
-	}
-	ctx := context.Background()
-
-	res, err := s.Load(ctx)
-	if err != nil {
-		t.Fatalf("Load on a read-only host path: %v", err)
-	}
-	if res.Document == nil || !res.QuarantineFailed {
-		t.Fatalf("result = %+v", res)
-	}
-
-	// Writing still fails, and says so plainly. That is the agent's cue to
-	// report a host-path fault rather than to infer anything about storage.
-	if _, err := s.Update(ctx, func(d *nodestate.Document) error {
-		d.Node = "worker-0"
-		return nil
-	}); err == nil {
-		t.Error("Update succeeded on a read-only directory")
-	} else if errors.Is(err, nodestate.ErrDurabilityUnconfirmed) {
-		t.Errorf("a write that never happened reports as merely unconfirmed: %v", err)
 	}
 }
 

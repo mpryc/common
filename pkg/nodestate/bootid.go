@@ -30,8 +30,10 @@ const maxBootIDFileBytes = 4096
 //     power loss.
 //
 // This is local evidence about the local kernel. It is not proof that a
-// *remote* node rebooted — for that, read node.Status.NodeInfo.BootID from
-// the API, which is what the design makes the completion oracle.
+// remote request completed. SBR first reads the exact Accepted execution from
+// the API, then reads the local boot ID, then conditionally publishes the
+// matching observation. A peer validates it before recording BootEnded.
+// Node.status.nodeInfo.bootID alone cannot establish that ordering.
 //
 // Every failure returns ErrBootIDUnavailable, wrapped around the underlying
 // cause so a caller can tell a missing procfs from a malformed value.

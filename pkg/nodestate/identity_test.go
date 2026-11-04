@@ -12,7 +12,7 @@ var identityBase = time.Date(2024, 9, 1, 0, 0, 0, 0, time.UTC)
 
 // TestUnrelatedRemediationsWithNoUIDAreNotMerged is the under-counting bug.
 //
-// CRRef.Key is UID plus generation, so a zero UID produced the same key for
+// The old UID/generation key let a zero UID produce the same key for
 // every reference and MergeReboots folded them into one record. A consumer
 // that filled kind, namespace and name but not UID — the least obvious field
 // to populate — would see three reboots counted as one, and the requested
@@ -23,15 +23,15 @@ func TestUnrelatedRemediationsWithNoUIDAreNotMerged(t *testing.T) {
 	doc := nodestate.NewDocument(nodestate.ComponentSBR)
 	doc.AppendReboot(nodestate.RebootEntry{
 		TS: identityBase, Reason: "first",
-		Remediation: &nodestate.CRRef{Kind: "SelfNodeRemediation", Name: "worker-0"},
+		Remediation: &nodestate.CRRef{NodeUID: "node-uid", Kind: "SelfNodeRemediation", Name: "worker-0"},
 	})
 	doc.AppendReboot(nodestate.RebootEntry{
 		TS: identityBase.Add(48 * time.Hour), Reason: "second",
-		Remediation: &nodestate.CRRef{Kind: "SelfNodeRemediation", Name: "worker-0"},
+		Remediation: &nodestate.CRRef{NodeUID: "node-uid", Kind: "SelfNodeRemediation", Name: "worker-0"},
 	})
 	doc.AppendReboot(nodestate.RebootEntry{
 		TS: identityBase.Add(96 * time.Hour), Reason: "third",
-		Remediation: &nodestate.CRRef{Kind: "StorageBasedRemediation", Name: "worker-0"},
+		Remediation: &nodestate.CRRef{NodeUID: "node-uid", Kind: "StorageBasedRemediation", Name: "worker-0"},
 	})
 
 	merged := nodestate.MergeReboots(doc)
@@ -57,11 +57,11 @@ func TestMergeDoesNotCollapseUIDLessReferencesAlreadyOnDisk(t *testing.T) {
 	doc := nodestate.NewDocument(nodestate.ComponentSBR)
 	doc.Reboots = []nodestate.RebootEntry{
 		{TS: identityBase, Reason: "first",
-			Remediation: &nodestate.CRRef{Kind: "SelfNodeRemediation", Name: "worker-0"}},
+			Remediation: &nodestate.CRRef{NodeUID: "node-uid", Kind: "SelfNodeRemediation", Name: "worker-0"}},
 		{TS: identityBase.Add(48 * time.Hour), Reason: "second",
-			Remediation: &nodestate.CRRef{Kind: "SelfNodeRemediation", Name: "worker-0"}},
+			Remediation: &nodestate.CRRef{NodeUID: "node-uid", Kind: "SelfNodeRemediation", Name: "worker-0"}},
 		{TS: identityBase.Add(96 * time.Hour), Reason: "third",
-			Remediation: &nodestate.CRRef{Kind: "StorageBasedRemediation", Name: "worker-0"}},
+			Remediation: &nodestate.CRRef{NodeUID: "node-uid", Kind: "StorageBasedRemediation", Name: "worker-0"}},
 	}
 
 	merged := nodestate.MergeReboots(doc)
@@ -78,26 +78,26 @@ func TestMergeDoesNotCollapseUIDLessReferencesAlreadyOnDisk(t *testing.T) {
 	}
 }
 
-// TestAppendRebootDropsAnUnusableReference keeps the bad reference off disk
+// TestAppendRebootRetainsUnresolvedRequestedReference keeps the bad reference off disk
 // in the first place.
-func TestAppendRebootDropsAnUnusableReference(t *testing.T) {
+func TestAppendRebootRetainsUnresolvedRequestedReference(t *testing.T) {
 	t.Parallel()
 
 	doc := nodestate.NewDocument(nodestate.ComponentSNR)
 	doc.AppendReboot(nodestate.RebootEntry{
 		TS: identityBase, Reason: "no uid",
-		Remediation: &nodestate.CRRef{Kind: "SelfNodeRemediation", Name: "worker-0"},
+		Remediation: &nodestate.CRRef{NodeUID: "node-uid", Kind: "SelfNodeRemediation", Name: "worker-0"},
 	})
 
-	if doc.Reboots[0].Remediation != nil {
-		t.Errorf("an unidentifiable reference was stored: %+v", doc.Reboots[0].Remediation)
+	if doc.Reboots[0].Remediation == nil {
+		t.Errorf("an unresolved requested reference was discarded: %+v", doc.Reboots[0].Remediation)
 	}
 	if doc.Reboots[0].Reason != "no uid" {
 		t.Error("the record itself was discarded; only the reference should be")
 	}
 
 	// A usable reference is kept untouched.
-	ref := &nodestate.CRRef{Kind: "SelfNodeRemediation", Name: "worker-0", UID: "uid-1", Generation: 2}
+	ref := &nodestate.CRRef{NodeUID: "node-uid", Kind: "SelfNodeRemediation", Name: "worker-0", UID: "uid-1", Generation: 2}
 	doc.AppendReboot(nodestate.RebootEntry{TS: identityBase.Add(time.Hour), Remediation: ref})
 	if doc.Reboots[1].Remediation == nil || doc.Reboots[1].Remediation.UID != "uid-1" {
 		t.Errorf("a valid reference was dropped: %+v", doc.Reboots[1].Remediation)
@@ -110,7 +110,7 @@ func TestAppendRebootChecked(t *testing.T) {
 	doc := nodestate.NewDocument(nodestate.ComponentSNR)
 
 	err := doc.AppendRebootChecked(nodestate.RebootEntry{
-		TS: identityBase, Remediation: &nodestate.CRRef{Kind: "SelfNodeRemediation", Name: "worker-0"},
+		TS: identityBase, Remediation: &nodestate.CRRef{NodeUID: "node-uid", Kind: "SelfNodeRemediation", Name: "worker-0"},
 	})
 	if !errors.Is(err, nodestate.ErrInvalidReference) {
 		t.Fatalf("error = %v, want ErrInvalidReference", err)
@@ -120,7 +120,7 @@ func TestAppendRebootChecked(t *testing.T) {
 	}
 
 	if err := doc.AppendRebootChecked(nodestate.RebootEntry{
-		TS: identityBase, Remediation: &nodestate.CRRef{UID: "uid-1", Generation: 1},
+		TS: identityBase, Remediation: &nodestate.CRRef{NodeUID: "node-uid", UID: "uid-1", Generation: 1},
 	}); err != nil {
 		t.Fatalf("a valid record was rejected: %v", err)
 	}
@@ -141,11 +141,11 @@ func TestCRRef_Validate(t *testing.T) {
 		ref     nodestate.CRRef
 		wantErr bool
 	}{
-		{"populated", nodestate.CRRef{UID: "uid-1", Generation: 1}, false},
-		{"generation zero is valid", nodestate.CRRef{UID: "uid-1"}, false},
-		{"zero value", nodestate.CRRef{}, true},
-		{"kind and name but no uid", nodestate.CRRef{Kind: "SelfNodeRemediation", Name: "worker-0"}, true},
-		{"negative generation", nodestate.CRRef{UID: "uid-1", Generation: -1}, true},
+		{"populated", nodestate.CRRef{NodeUID: "node-uid", UID: "uid-1", Generation: 1}, false},
+		{"generation zero is valid", nodestate.CRRef{NodeUID: "node-uid", UID: "uid-1"}, false},
+		{"zero value", nodestate.CRRef{NodeUID: "node-uid"}, true},
+		{"kind and name but no uid", nodestate.CRRef{NodeUID: "node-uid", Kind: "SelfNodeRemediation", Name: "worker-0"}, true},
+		{"negative generation", nodestate.CRRef{NodeUID: "node-uid", UID: "uid-1", Generation: -1}, true},
 	}
 	for _, tt := range tests {
 		tt := tt
@@ -167,7 +167,7 @@ func TestCRRef_Validate(t *testing.T) {
 func TestMergeStillDeduplicatesIdentifiableReferences(t *testing.T) {
 	t.Parallel()
 
-	ref := &nodestate.CRRef{Kind: "SelfNodeRemediation", UID: "uid-1", Generation: 2}
+	ref := &nodestate.CRRef{NodeUID: "node-uid", Kind: "SelfNodeRemediation", UID: "uid-1", Generation: 2}
 
 	snr := nodestate.NewDocument(nodestate.ComponentSNR)
 	snr.AppendReboot(nodestate.RebootEntry{
@@ -188,14 +188,14 @@ func TestMergeStillDeduplicatesIdentifiableReferences(t *testing.T) {
 // record loses its reference but must not be mistaken for a self-fence the
 // agent decided on alone... except that is exactly what it becomes, so the
 // test pins the consequence rather than wishing it away.
-func TestUnidentifiableRecordsStayDistinctAndCountAsAutonomous(t *testing.T) {
+func TestUnidentifiableRecordsStayDistinctAndRequested(t *testing.T) {
 	t.Parallel()
 
 	doc := nodestate.NewDocument(nodestate.ComponentSBR)
 	for i := 0; i < 3; i++ {
 		doc.AppendReboot(nodestate.RebootEntry{
 			TS:          identityBase.Add(time.Duration(i) * time.Hour),
-			Remediation: &nodestate.CRRef{Kind: "SelfNodeRemediation", Name: "worker-0"},
+			Remediation: &nodestate.CRRef{NodeUID: "node-uid", Kind: "SelfNodeRemediation", Name: "worker-0"},
 		})
 	}
 
@@ -204,11 +204,9 @@ func TestUnidentifiableRecordsStayDistinctAndCountAsAutonomous(t *testing.T) {
 	requested := nodestate.CountReboots(identityBase.Add(-time.Hour),
 		func(r nodestate.RebootEntry) bool { return r.Remediation != nil }, doc)
 
-	// AppendReboot stripped the unusable reference, so these count against
-	// the autonomous budget. That is the conservative direction — the
-	// autonomous budget stops self-fencing, where the requested one fails a
-	// resource — and all three are still counted, which is what matters.
-	if autonomous != 3 || requested != 0 {
-		t.Errorf("autonomous=%d requested=%d, want 3 and 0", autonomous, requested)
+	// Unknown requested identities remain requested and distinct; they must not
+	// be charged to an unrelated autonomous budget.
+	if autonomous != 0 || requested != 3 {
+		t.Errorf("autonomous=%d requested=%d, want 0 and 3", autonomous, requested)
 	}
 }

@@ -28,31 +28,32 @@ type Snapshot struct {
 
 	// TakenAt is when the reading started.
 	TakenAt time.Time
+
+	// Err records invalid input or incomplete collection (including cancellation).
+	Err error
 }
 
-// Snapshot reads the named components, or KnownComponents plus this Store's
-// own when none are named, and returns everything it learned.
+// Snapshot reads the explicitly named components, or only this Store's own
+// component when none are named. Other installed controllers are not implicitly
+// part of this consumer's history. Pass all expected components explicitly when
+// deliberately combining histories.
 //
 // Nothing is written: like ReadAll, this is a read-only view and does not
 // quarantine, not even this Store's own damaged file. Use Load for the
-// start-up classification, which does.
+// start-up classification and durability confirmation.
 //
-// A cancelled context yields an empty Snapshot rather than an error, for the
-// same reason ReadAll has no error return: every failure here is one the
-// caller has to carry on through.
+// A cancelled context is recorded in Err and in every unread component. Such
+// a snapshot is incomplete and must not be used to authorize another reset.
 func (s *Store) Snapshot(ctx context.Context, components ...Component) *Snapshot {
 	snap := &Snapshot{
 		Peers:   make(map[Component]*PeerRead, len(components)),
 		TakenAt: s.clock.Now(),
 	}
-	if ctx.Err() != nil {
-		return snap
+	if err := ctx.Err(); err != nil {
+		snap.Err = err
 	}
 	if len(components) == 0 {
-		components = KnownComponents()
-		if !containsComponent(components, s.self) {
-			components = append(components, s.self)
-		}
+		components = []Component{s.self}
 	}
 
 	for _, c := range components {
@@ -61,8 +62,8 @@ func (s *Store) Snapshot(ctx context.Context, components ...Component) *Snapshot
 		}
 		read, err := s.LoadPeer(ctx, c)
 		if err != nil {
-			// An invalid component name or a cancelled context. Neither is
-			// a statement about this node's state, so record nothing.
+			snap.Err = err
+			snap.Peers[c] = &PeerRead{Status: PeerUnreadable, Cause: err}
 			continue
 		}
 		snap.Peers[c] = read
@@ -125,16 +126,19 @@ func (sn *Snapshot) CountReboots(since time.Time, match func(RebootEntry) bool) 
 // unknown number of records from the merge, and no amount of inspecting what
 // did load will reveal that.
 //
-// A component that is simply absent does not make the history incomplete. A
-// peer that has never run on this node has no records to be missing, which
-// is the ordinary case on a node where only one agent is deployed.
+// An absent component is unknown: it may never have run, or its history may
+// have been lost. Pass the explicit set of expected components when optional
+// peers are not installed. Absence alone must not replenish a reboot budget.
 func (sn *Snapshot) HistoryComplete(since time.Time) bool {
-	if sn == nil {
+	if sn == nil || sn.Err != nil || len(sn.Peers) == 0 {
 		return false
 	}
 	for _, read := range sn.Peers {
+		if read == nil {
+			return false
+		}
 		switch read.Status {
-		case PeerOK, PeerAbsent:
+		case PeerOK:
 		default:
 			return false
 		}
@@ -155,7 +159,7 @@ func (sn *Snapshot) Missing() []Component {
 	var out []Component
 	for c, read := range sn.Peers {
 		switch read.Status {
-		case PeerOK, PeerAbsent:
+		case PeerOK:
 		default:
 			out = append(out, c)
 		}

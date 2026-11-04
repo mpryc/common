@@ -4,21 +4,18 @@ import (
 	"encoding/json"
 	"fmt"
 	"reflect"
-	"strconv"
 	"time"
 )
 
-// Contract constants. These are fixed by the medik8s node-state agreement and
-// are not configurable at run time; Store.WithDir exists for tests and for
-// unusual deployments, not for retargeting production.
+// Default paths and schema constants for component-owned host journals.
 const (
-	// Dir is the node-local state directory shared by every medik8s agent.
+	// Dir is the default node-local directory for participating components.
 	Dir = "/var/lib/medik8s/state"
 
 	// FileExtension is appended to a Component to form its file name.
 	FileExtension = ".json"
 
-	// SBRFile and SNRFile are the two files the contract defines.
+	// SBRFile and SNRFile are conventional names, not required installed files.
 	SBRFile = string(ComponentSBR) + FileExtension
 	SNRFile = string(ComponentSNR) + FileExtension
 
@@ -66,11 +63,12 @@ const (
 
 // Document is one agent's node-local state file.
 //
-// Exactly one component writes a given Document; every component may read all
-// of them. Treat a Document read from disk as diagnostic evidence, never as
-// authority for a destructive action — anything privileged on the node can
-// write this directory, so fencing decisions must be grounded in the
-// Kubernetes API. See the package documentation.
+// Exactly one component owns a given Document. Other components may explicitly
+// read it if their integration requires it; no cross-component sharing is
+// assumed. Required consumer state lives in Agent.Extra and diagnostic history
+// lives in Reboots. This envelope alone grants no execution or cleanup authority.
+// The consumer validates its state, identities and authorization policy.
+// Privileged host processes are outside the trust boundary. See package docs.
 //
 // Unknown preserves members written by a newer peer. Encoding and decoding a
 // Document round-trips them unchanged.
@@ -94,7 +92,7 @@ type Document struct {
 	// It never decreases: a Store that finds a higher revision on disk than it
 	// last wrote continues from the higher value.
 	Revision uint64 `json:"revision,omitempty"`
-	// WriterID identifies the Store instance that last wrote the document. A
+	// WriterID identifies the process that last wrote the document. A
 	// value other than the reader's own is how a foreign write is detected.
 	WriterID string `json:"writerID,omitempty"`
 
@@ -142,6 +140,20 @@ type Document struct {
 	// past it, the same history becomes a complete answer again.
 	RebootHistoryCompleteSince time.Time `json:"rebootHistoryCompleteSince"`
 
+	// HistoryReconciledAt is when ReconcileHistory last replaced this
+	// history, or zero if it never did.
+	//
+	// It lives in the envelope rather than the event ring because the ring
+	// is pruned: a consumer that discovers a month later that its reset
+	// budget was reconstructed rather than observed has discovered it too
+	// late. Load turns it into StatusRecovered while it still describes the
+	// records a budget would be computed from.
+	HistoryReconciledAt time.Time `json:"historyReconciledAt"`
+
+	// RebootHistoryUnknown records dropped entries with unknown timestamps.
+	// Only explicit consumer reconciliation can clear it.
+	RebootHistoryUnknown bool `json:"rebootHistoryUnknown,omitempty"`
+
 	// Unknown holds top-level members written by a build newer than this one.
 	// It is populated on decode and re-emitted on encode. Callers do not
 	// normally touch it.
@@ -172,10 +184,21 @@ type AgentState struct {
 	StartedAt time.Time `json:"startedAt"`
 	// Shutdown records how the agent last stopped.
 	Shutdown ShutdownState `json:"shutdown,omitempty"`
-	// FenceLatched reports that the agent has committed to a fence that has
-	// not yet taken effect. An agent that cannot write its state file must not
-	// disarm its watchdog while this is set.
-	FenceLatched bool `json:"fenceLatched,omitempty"`
+	// ResetCommitted reports that the agent has committed to a reset that has
+	// not yet taken effect in its bound boot. A later write failure must not
+	// disarm the committed watchdog in that boot. After a valid boot change, the
+	// consumer atomically clears the old commitment and preserves attempt and
+	// budget records before arming the new watchdog. Common does not perform
+	// this policy.
+	//
+	// The name is "reset", not "fence", deliberately. The per-node block mode
+	// this package serves has no fence: no shared NodeMap, no peer heartbeat
+	// and no fence message. Carrying fencing vocabulary into it would
+	// re-import the model the mode exists to escape. It is also one of three
+	// names the design had for a single fact — a journal commitment — now
+	// unified on "commit": this field, "local commitment" in prose, and
+	// commitState: Committed inside the consumer's own record.
+	ResetCommitted bool `json:"resetCommitted,omitempty"`
 	// Extra carries agent-specific key/value state without requiring a schema
 	// change in this shared package.
 	Extra map[string]string `json:"extra,omitempty"`
@@ -265,11 +288,13 @@ type RebootEntry struct {
 	Remediation *CRRef `json:"remediation,omitempty"`
 	// BeforeBootID is the kernel boot id current when the entry was written.
 	BeforeBootID string `json:"beforeBootID,omitempty"`
-	// AfterBootID is the boot id observed once the node came back. It is
-	// confirmation, not proof: the authority for "this node rebooted" is
-	// node.Status.NodeInfo.BootID read from the API.
+	// AfterBootID is a diagnostic local boot observation. It does not establish
+	// ordered execution evidence. SBR reads the exact Accepted Node record before
+	// reading the local boot ID and conditionally publishes that observation;
+	// a peer validates it before setting BootEnded. Raw Node status is insufficient.
 	AfterBootID string `json:"afterBootID,omitempty"`
-	// Completed reports that the reboot is known to have taken effect.
+	// Completed reports a diagnostic completion observation, not API acceptance,
+	// BootEnded, continuing isolation, or permission to clean up workloads.
 	Completed bool `json:"completed"`
 
 	// Unknown holds members written by a newer build. See Document.Unknown.
@@ -285,9 +310,21 @@ type CRRef struct {
 	// Name is the resource name. A node health check names the resource after
 	// the node, so the name is reused across episodes and is not an identity.
 	Name string `json:"name,omitempty"`
-	// UID is the resource UID. With Generation it is the identity used for
-	// de-duplication across both state files.
+	// UID and NodeUID form the execution identity across state files.
+	//
+	// Both are required and generation is deliberately excluded. A request
+	// keeps one identity for its whole life: a changed generation, a
+	// replaced configuration or a later boot must not grant the same
+	// resource another attempt, and treating them as distinct identities
+	// would let one request be charged to the budget twice.
 	UID string `json:"uid,omitempty"`
+	// NodeUID is the immutable target Node identity, not its name or slot.
+	//
+	// The name is not an identity here: a node health check names the
+	// remediation resource after the node, and a replacement node can reuse
+	// the name. Keying on the UID stops a replacement inheriting its
+	// predecessor's execution history.
+	NodeUID string `json:"nodeUID,omitempty"`
 	// Generation is the spec generation the reboot served.
 	Generation int64 `json:"generation,omitempty"`
 
@@ -295,30 +332,27 @@ type CRRef struct {
 	Unknown map[string]json.RawMessage `json:"-"`
 }
 
-// Key returns the de-duplication identity of the reference: UID and
-// generation, and nothing else.
-//
-// Kind, namespace and name are deliberately excluded. One remediation episode
-// can be carried out by two different agents recording two different kinds for
-// the same underlying request; counting it twice would halve an operator's
-// effective reboot budget.
-//
-// Key is only meaningful for a reference that satisfies Validate. Without a
-// UID every reference produces the same key, which is why MergeReboots
-// refuses to de-duplicate on one.
+// Key returns the CR UID and Node UID pair. Generation is evidence metadata,
+// never permission to execute a request again. Invalid references return
+// an empty key and cannot participate in matching or deduplication.
 func (r CRRef) Key() string {
-	return r.UID + "@" + strconv.FormatInt(r.Generation, 10)
+	if r.Validate() != nil {
+		return ""
+	}
+	// JSON array encoding avoids delimiter collisions without assuming UID syntax.
+	key, _ := json.Marshal([2]string{r.UID, r.NodeUID})
+	return string(key)
 }
 
 // Validate reports whether the reference can identify a remediation.
 //
-// The UID is the whole of the identity. A reference carrying a kind and a
+// Both the resource UID and target Node UID are required. A reference carrying a kind and a
 // name but no UID looks informative and is not: a node health check names the
 // remediation resource after the node, so the same name is reused for every
 // episode on that node and distinguishes nothing.
 func (r CRRef) Validate() error {
-	if r.UID == "" {
-		return fmt.Errorf("%w: a remediation reference needs a UID; kind %q and name %q do not identify one",
+	if r.UID == "" || r.NodeUID == "" {
+		return fmt.Errorf("%w: a remediation reference needs both CR UID and Node UID; kind %q and name %q do not identify one",
 			ErrInvalidReference, r.Kind, r.Name)
 	}
 	if r.Generation < 0 {
@@ -477,20 +511,14 @@ func (d *Document) AppendEvent(e EventEntry) {
 	d.Events = append(d.Events, e)
 }
 
-// AppendReboot adds one reboot record. Records are never de-duplicated here:
-// use MergeReboots when counting across files.
-//
-// A Remediation reference with no UID is dropped and the record is kept as an
-// autonomous reboot. Storing it would be worse than useless: it cannot be
-// matched to the remediation it served, it cannot be reconciled with the
-// peer's record of the same reboot, and it would be charged to a requested
-// budget it can never be settled against. Use AppendRebootChecked at a call
-// site that would rather be told.
+// AppendReboot adds a diagnostic record. Unresolved requested identities stay
+// requested and are never merged. AppendRebootChecked rejects invalid identities.
+// Authoritative SBR identity and reset-budget records belong in Agent.Extra;
+// retention does not prune that map.
 func (d *Document) AppendReboot(e RebootEntry) {
-	if e.Remediation != nil && !e.Remediation.identifies() {
-		e.Remediation = nil
-	}
-	d.Reboots = append(d.Reboots, e)
+	// Preserve unresolved requested identities as requested; never charge them
+	// to the autonomous budget. They will not be merged or matched.
+	d.Reboots = append(d.Reboots, e.clone())
 }
 
 // AppendRebootChecked is AppendReboot that reports a malformed remediation

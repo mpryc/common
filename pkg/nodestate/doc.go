@@ -1,272 +1,94 @@
-// Package nodestate reads and writes the node-local state files that medik8s
-// remediation agents share.
+// Package nodestate stores node-local history for remediation agents.
 //
-// Several agents may run on one node — storage-based remediation and
-// self-node remediation today, others later — and each needs durable local
-// notes that survive its own restart and the node's reboot: what it has
-// committed to, what it has already done, and what it believed the last time
-// it could see the cluster. Each agent also needs to read its peers' notes,
-// so that one remediation carried out by two components is counted once.
+// # Ownership and execution
 //
-// # The model
+// Each component writes its own JSON file under /var/lib/medik8s/state. A Store
+// serializes operations for the same path within one process. The consuming
+// agent must hold a stable host executor lock for its lifetime; atomically
+// replacing JSON does not exclude another process. The read-only reporter uses
+// LoadPeer or Snapshot and never performs mutable recovery.
 //
-// One directory, one file per writer, no lock:
+// Keep probe I/O, journal I/O, watchdog feeds and peer reconciliation on separate
+// execution paths. File I/O is not cancellable once it enters the kernel. Allow
+// only one outstanding journal operation; a timeout does not end that operation.
+// A previously established commitment must not be cancelled by a later I/O fault.
 //
-//	/var/lib/medik8s/state/
-//	├── sbr.json   written only by the storage agent;      read by all
-//	└── snr.json   written only by the self-remediation agent; read by all
+// # Startup and recovery
 //
-// Three properties follow, and they are the whole design:
+// Load returns a classification. StatusOK means readable supported contents whose
+// file and directory synchronization succeeded. It is not evidence of API
+// ownership, a reboot, continuing isolation, or workload-cleanup authorization.
+// The consumer must validate its own versioned Agent.Extra values and live
+// identities. ReadBootID supplies local kernel identity, not remote reboot proof.
 //
-//   - Single writer. A Store writes exactly one file — the one named after
-//     its own Component — and refuses any other with ErrNotOwner. A damaged
-//     peer file is never repaired, never quarantined, never touched.
+// StatusAbsent cannot distinguish first installation from loss of the entire
+// directory. Before deliberately initializing with Write, verify that no live
+// unresolved execution exists and that all required reset history is known.
+// Otherwise remain in HistoryReconciliationRequired. A missing file never proves
+// that a request has not already executed.
 //
-//   - Atomic replace. A write goes to a temporary file in the same directory,
-//     is flushed, renamed over the target, and the directory entry is flushed
-//     in turn. A concurrent reader sees the whole previous version or the
-//     whole new one. A failure anywhere leaves the previous version in place.
+// Corrupt and unsupported files stay at the live path. StatusCorrupt means
+// reconciliation is required, not that recovery succeeded. Update and Write
+// refuse to replace such history. Operational and access errors are returned,
+// without quarantining the file. No event ring or cleanup policy can erase this
+// distinction: the original evidence remains until explicitly reconciled.
+// ReconcileHistory requires a consumer-authorized reconciliation callback and an
+// audit reason. It must preserve known commitments, identities and reset budgets.
+// Neither API-object absence nor elapsed time is sufficient authorization.
 //
-//   - No lock. Because there is one writer per file and replacement is
-//     atomic, there is nothing to serialise between processes. That is not a
-//     simplification for its own sake. The product exists to handle broken
-//     storage, and a node whose storage stack is failing produces processes
-//     stuck in uninterruptible sleep. A cross-process lock in the feeding
-//     path of a hardware watchdog would be a liveness hazard in precisely the
-//     state the watchdog is there for.
+// # Durability
 //
-// # What a state file is for, and what it is not for
+// Writes use temporary file, write, file fsync, close, rename and directory fsync.
+// Only nil error confirms durability. ErrDurabilityUnconfirmed means the new
+// record is visible but MUST NOT authorize a new reset. Do not repeat a
+// non-idempotent mutation: pass the returned candidate to ConfirmDurability.
+// It checks that the candidate is still current and synchronizes it without
+// changing its revision or invoking the mutator. A mismatch is ErrStateChanged.
+// Load synchronizes the surviving document after restart. The consumer must
+// reconcile that surviving state with live execution records; a missing/older commitment
+// is not proof that an earlier uncertain operation did not execute.
 //
-// It is for de-duplication, history and post-mortem.
+// Update also confirms the current history before invoking the callback. This
+// permits a subsequent transition only after the predecessor is durable. A failed
+// predecessor confirmation returns no document and never invokes the callback.
+// Read-only peers see complete snapshots, but do not confirm the writer's action
+// or grant authority. A host file must never be the sole authority for cleanup.
 //
-// It is not authority. Any workload privileged enough to run on the node can
-// write this directory, so a record here is forgeable. A forged reboot record
-// could suppress a fence that should happen; forged fencing evidence could
-// cause pods to be force-deleted on a node that is still running them, which
-// turns a node-local write into cluster-wide data loss.
+// # Identity, retention and schema evolution
 //
-// The rule that follows is absolute: no state file may ever be the sole
-// authority for a destructive action. Evidence that a node rebooted comes
-// from node.Status.NodeInfo.BootID read from the Kubernetes API. The file
-// says what this agent did; the API says what is true.
+// CRRef execution identity is the pair (CR UID, Node UID). Generation is evidence
+// metadata, not permission for another reset. References missing either
+// UID cannot be matched or merged. They remain requested diagnostic records;
+// AppendRebootChecked rejects them for new writes.
 //
-// # Usage
+// Reboots, IO, Events and Conditions are diagnostic collections with retention.
+// SBR stores schemaVersion, activeAttempt, resetBudget and outageState as
+// opaque strings in Agent.Extra. Its Node execution record owns acceptance,
+// cancellation and BootEnded; the local journal retains reservations, the
+// boot-bound latch and accounting. Common never prunes that map or interprets
+// consumer state machines. If required records do
+// not fit, writes fail with ErrTooLarge rather than dropping those records.
+// Unknown JSON fields survive supported read-modify-write cycles; exceeding a
+// configured preservation limit refuses the operation without deleting fields.
 //
-// Construct one Store per agent, naming the component it writes for:
+// Snapshot and ReadAll default to this Store's component only. SBR does not
+// depend on an SNR file. Other controllers can own independent files, and
+// callers can explicitly request several components.
+// Snapshot retains failed or cancelled reads. HistoryComplete must be checked
+// before treating CountReboots as more than a lower bound. Even a syntactically
+// complete diagnostic history is not a replacement for the authoritative ledger.
+// Pruning records with tied timestamps excludes the discarded timestamp from
+// the complete interval. A clock rollback cannot restore discarded history.
 //
-//	store, err := nodestate.New(nodestate.ComponentSBR)
-//	if err != nil {
-//	    return err
-//	}
-//	if err := store.EnsureDirectory(ctx); err != nil {
-//	    return err // a host-path fault; see below
-//	}
+// # Paths and deployment
 //
-// Classify what you find at start-up. The distinction between "the agent
-// restarted" and "the node rebooted" is what keeps a rolling upgrade from
-// consuming a node's reboot budget:
+// Reads and writes reject disallowed ownership, permissions and symlinks,
+// including ancestor symlinks. These path checks are defense in depth against
+// deployment errors, not protection from privileged concurrent ancestor swaps.
+// Protect the host directory and hold the executor lock. Compromised host root
+// is outside the trust boundary. CheckDurableStorage rejects known unsuitable
+// filesystems; it does not prove a correct persistent host mount. The deployment
+// must validate its mount (a disk-backed emptyDir is still not host history).
 //
-//	res, err := store.Load(ctx)
-//	if err != nil {
-//	    return err
-//	}
-//	switch {
-//	case res.Status == nodestate.StatusAbsent:
-//	    // First boot. No history, and none was lost.
-//	case res.HistoryLost():
-//	    // The file was unusable and has been quarantined at
-//	    // res.QuarantinePath. Emit an event naming res.Cause, and treat any
-//	    // budget as starting from zero.
-//	case res.Document.BootID == currentBootID:
-//	    // The agent restarted; the node did not. Resume.
-//	default:
-//	    // The node rebooted. res.Document.Agent.Shutdown says whether it was
-//	    // orderly.
-//	}
-//
-// Record through Update, which loads, mutates, trims and writes as one
-// serialised step:
-//
-//	_, err := store.Update(ctx, func(d *nodestate.Document) error {
-//	    d.BootID = currentBootID
-//	    d.Agent.Shutdown = nodestate.ShutdownRunning
-//	    d.AppendReboot(nodestate.RebootEntry{
-//	        TS:          time.Now(),
-//	        Source:      nodestate.ComponentSBR,
-//	        Method:      nodestate.MethodWatchdog,
-//	        Reason:      "RemediationCR",
-//	        Remediation: &nodestate.CRRef{Kind: "...", UID: string(cr.UID), Generation: cr.Generation},
-//	    })
-//	    return nil
-//	})
-//
-// Count across both files, so that one remediation counts once however it
-// was carried out, and check that the history actually covers the window
-// before treating the count as an answer:
-//
-//	snap := store.Snapshot(ctx)
-//
-//	autonomous := snap.CountReboots(windowStart,
-//	    func(r nodestate.RebootEntry) bool { return r.Remediation == nil })
-//
-//	if !snap.HistoryComplete(windowStart) {
-//	    // Records from inside the window are missing: aged out, dropped by
-//	    // the ceiling, or in a file this process could not read. The count
-//	    // is a lower bound, so fail toward counting — a reboot loop is the
-//	    // case the budget exists for, and it is the case that produces the
-//	    // most records.
-//	    //
-//	    // snap.Missing() names the components that could not be read, and
-//	    // PeerRead.Configured says which of those are this node's fault.
-//	}
-//
-// Use Snapshot rather than composing ReadAll with MergeReboots and
-// RebootHistoryComplete. The primitives are still there and still correct,
-// but they cannot see what ReadAll dropped: a peer file this process may not
-// read disappears from the merge, and RebootHistoryComplete, handed only
-// what survived, reports the history as whole. The count then comes out low
-// and confident, which is the worst shape a budget error can take.
-//
-// # Bounding the file
-//
-// The state directory is on the node's root filesystem and nothing prunes it
-// but this library, so every collection has a bound and nothing accumulates
-// without one.
-//
-// Store.Update applies the retention policy on every write: the I/O and event
-// logs are rings, conditions are capped, and reboot records are trimmed by
-// age. Reboots are not trimmed by count in normal operation, because a node
-// in a reboot loop is the node with the most records and discarding them
-// would hand it a fresh budget.
-//
-// Two bounds qualify that, in opposite directions. Below, a floor the age
-// trim will not go under whatever the records' apparent age: the clock is the
-// trim's only input and is least trustworthy exactly when this matters, on a
-// node returning from a total outage with NTP about to step it. Above, an
-// outer ceiling sized to keep a full document inside the write limit, because
-// an agent that cannot write its state file is in the worst position of all.
-// Whenever either bound drops a record, Document.RebootHistoryCompleteSince
-// moves rather than the history pretending to still be whole.
-//
-// Store.CheckDurableStorage is the other half, and it is about where the
-// directory is rather than what is in it. If the host path was never mounted
-// — forgotten, misspelled, or an emptyDir used by mistake — the agent writes
-// happily into the container's own layer or into memory. Nothing errors, and
-// the state resets on every pod replacement, so the reboot budget never
-// accumulates and the brake never applies. Call it once at start-up; it is
-// deliberately not wired into Write, because whether to run degraded on
-// non-durable storage is the consumer's decision.
-//
-// Store.Cleanup reclaims what is left in the directory rather than in the
-// document: temporary files abandoned by a process that was killed mid-write,
-// and quarantined copies past their count or age. It runs once per Store on
-// the first write and after every quarantine, so an agent that never calls it
-// still does not leak; call it from a periodic janitor to get the counts.
-//
-// All of this is safe to interrupt. Nothing in a sweep writes or replaces the
-// live document — it only removes files that are not it — and the document
-// itself is only ever replaced by the atomic sequence described above. A
-// process killed in the middle of any of it leaves, at worst, a temporary
-// file that the next sweep reclaims. There is no instant at which a reader
-// sees anything other than a whole state file or no state file.
-//
-// # Failure handling
-//
-// Failures are split into three kinds, and the split is the point: a caller
-// that treats them alike will get one of them wrong.
-//
-// A peer's problem is never yours. ReadPeer returns (nil, nil) for an absent,
-// empty, truncated, oversized, symlinked, wrongly-owned or future-schema
-// peer file. There is no error to handle, by design.
-//
-// One of those is not the peer's problem, though. A file that is there and
-// cannot be read — permission denied, an owner the policy rejects, an
-// SELinux denial — is a deployment fault on this node, and flattening it to
-// "the peer has never run" hides something that will not fix itself and that
-// quietly removes that peer's reboots from every budget merged here. Use
-// LoadPeer where the distinction matters and raise a condition on
-// PeerRead.Configured.
-//
-// Your own file repairs itself. Load quarantines an unusable file, preserving
-// its bytes under a *.corrupt name so the shape of the damage survives for a
-// post-mortem, and returns a fresh Document with StatusRecovered. The caller
-// keeps working; what it must do is notice, because its history is gone.
-//
-// The state directory is refused if its path reaches it through a symbolic
-// link at any level, not only at the last component. That closes the case
-// where an installer or an operator has redirected /var/lib/medik8s and
-// every per-file check still passes because the leaf really is a regular
-// root-owned file in a private directory. It is not a defence against a
-// race — an attacker who can create directories under /var/lib can swap a
-// component after the check — and closing that would mean holding a
-// directory descriptor and working through openat, which defends against
-// someone who already has privileged write access to the node. Set
-// SecurityPolicy.AllowSymlinks where a deployment redirects the path on
-// purpose; note that tests on macOS need it, or a resolved path, because
-// temporary directories there sit under /var.
-//
-// A host-path fault is yours to report, not to act on. If the directory
-// cannot be created, has permissions that make its contents untrustworthy, or
-// cannot be written, the operation returns a *PathError wrapping one of the
-// package sentinels. Being unable to keep a note is evidence about this
-// agent's bookkeeping and nothing else: it must never set a storage-health
-// condition, and it must never cause a reboot. Equally, an agent that has
-// already latched a fence must not disarm its watchdog merely because it
-// could not record that fact.
-//
-// # Concurrency, and the limits of what a library can promise
-//
-// A Store is safe for concurrent use. Writes and Update cycles within one
-// process are serialised, so goroutines cannot lose each other's changes.
-//
-// Across processes, the single-writer rule is a contract this library cannot
-// enforce — nothing stops a second process opening the same path. What it
-// does instead is detect the violation. Each write stamps an identity built
-// from the kernel boot id, the process id and the process start time, plus
-// an increasing revision, and Load reports LoadResult.ForeignWrite when the
-// file came from someone else.
-//
-// It reports and carries on. It never refuses to write, and there is no
-// option to make it: an agent that stops recording because it suspects a
-// second writer is worse than one that overwrites a record which should not
-// have existed. Refusing would also reintroduce, at start-up, exactly the
-// liveness hazard the lock-free design exists to avoid — a predecessor stuck
-// in uninterruptible sleep would keep its replacement from ever starting.
-//
-// Deployments must still hold up their end. Set maxSurge to 0 on any
-// DaemonSet running an agent, so a rolling update never runs two at once.
-// That is the Kubernetes default for a DaemonSet, so it holds unless someone
-// changes it — which is a reason to set it explicitly rather than to rely on
-// it. One window remains open regardless: a pod stuck terminating, which is
-// what a storage fault produces, can have its pod object force-deleted while
-// the container is still alive. ForeignWrite is how that becomes visible.
-//
-// None of these operations is cancellable. The context is checked before work
-// begins, but a file operation in progress cannot be interrupted, and on a
-// node with failing storage it can block for a long time. Do not place a
-// state-file write on the path that feeds a hardware watchdog. If you need a
-// bound, run the write on its own goroutine and abandon the result.
-//
-// # Schema evolution
-//
-// Add optional members. Do not bump Schema.
-//
-// Two operators on different release cadences read and write this format, so
-// a staggered upgrade is the normal case, not an edge case. Members this
-// build does not recognise are preserved verbatim through a read-modify-write
-// — the thing encoding/json will not do for you — so a newer peer's data
-// survives an older peer rewriting the file. That machinery is what makes
-// additive change free.
-//
-// A Schema bump is not free: every older peer then treats the file as
-// unreadable, quarantines it, and starts fresh. Reserve it for a change an
-// older build would actively misinterpret, rather than merely ignore.
-//
-// # Dependencies
-//
-// This package and its nodestatetest subpackage import only the Go standard
-// library. That is a hard constraint, enforced in CI. The file is JSON on
-// disk and needs no Kubernetes types, and the consuming operators are on
-// different Kubernetes versions; a dependency here would have to be
-// reconciled across all of them.
+// This package and nodestatetest depend only on the Go standard library.
 package nodestate

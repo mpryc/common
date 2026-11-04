@@ -10,33 +10,6 @@ import (
 	"strings"
 )
 
-// --- quarantine ---
-
-// quarantine moves an unusable file aside, preserving its bytes exactly, and
-// returns the new path.
-//
-// Preserving the bytes is the point. The file is the only record of what the
-// agent believed before it broke, and the shape of the damage — truncated at
-// a block boundary, zero-filled, half of an older version — is what tells an
-// operator whether they are looking at a crash, a full disk or a filesystem
-// problem.
-//
-// Only the owner of a file ever calls this.
-func (s *Store) quarantine(path string) (string, error) {
-	stamp := s.clock.Now().UTC().Format(quarantineTimeLayout)
-	unique, err := randomSuffix()
-	if err != nil {
-		return "", err
-	}
-	dest := fmt.Sprintf("%s.%s-%s%s", path, stamp, unique[:8], quarantineSuffix)
-
-	if err := s.fs.Rename(path, dest); err != nil {
-		return "", pathErrorf("rename", path, err)
-	}
-	_, _ = s.sweep()
-	return dest, nil
-}
-
 // --- housekeeping ---
 //
 // Everything in this section removes files. None of it ever writes the live
@@ -70,8 +43,8 @@ type CleanupReport struct {
 // copy is left behind deliberately, as evidence, and is kept to a fixed
 // number and age.
 //
-// It is called for you: once per Store on the first write, and after every
-// quarantine. Call it directly from a periodic janitor on a long-lived agent,
+// It is called once per Store on the first write. Call it directly from a
+// periodic janitor on a long-lived agent,
 // or at start-up to get the counts into a log line.
 //
 // Only this component's files are touched, by the same ownership rule that
@@ -91,6 +64,9 @@ func (s *Store) Cleanup(ctx context.Context) (*CleanupReport, error) {
 // Failures are reported but not fatal to the caller that triggered the sweep:
 // being unable to tidy up is not a reason to fail a read or a write.
 func (s *Store) sweep() (*CleanupReport, error) {
+	if err := s.verifyDirectoryIfPresent(); err != nil {
+		return nil, err
+	}
 	s.swept = true
 	report := &CleanupReport{}
 

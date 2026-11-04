@@ -24,13 +24,11 @@ const (
 	// leaving a dead one in place for an hour.
 	DefaultOrphanGrace = time.Hour
 
-	// DefaultMaxPreservedBytes caps the total size of the members this build
-	// does not recognise but carries forward. Preservation exists so a newer
-	// peer's few extra fields survive a downgrade, not so the file can be
-	// used as storage: without a cap, anything able to write the directory
-	// could stuff it past DefaultMaxDocumentBytes and leave the agent unable
-	// to write its own state ever again.
-	DefaultMaxPreservedBytes = 64 << 10 // 64 KiB
+	// DefaultMaxPreservedBytes permits extensions up to the document write limit.
+	// Exceeding a configured preservation limit refuses the operation without
+	// deleting fields or changing the original file.
+
+	DefaultMaxPreservedBytes = DefaultMaxDocumentBytes
 )
 
 // HousekeepingPolicy bounds what accumulates in the state directory and in
@@ -63,9 +61,8 @@ type HousekeepingPolicy struct {
 	OrphanGrace time.Duration
 
 	// MaxPreservedBytes caps unrecognised members carried forward from a
-	// newer peer. Beyond it they are dropped and the fact is recorded as an
-	// EventReasonPreservedFieldsDropped event. Use Unlimited to disable the
-	// cap, at the risk described on DefaultMaxPreservedBytes.
+	// newer peer. Beyond it the operation fails with ErrTooLarge and leaves
+	// the original file untouched. Use Unlimited to disable this separate cap.
 	MaxPreservedBytes int
 }
 

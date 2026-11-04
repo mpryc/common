@@ -304,7 +304,7 @@ func TestLoad_RoundTrip(t *testing.T) {
 		Method:      nodestate.MethodWatchdog,
 		Reason:      "TotalOutage",
 		EpisodeID:   "ep-1",
-		Remediation: &nodestate.CRRef{Kind: "SBR", Name: "n", UID: "u", Generation: 3},
+		Remediation: &nodestate.CRRef{NodeUID: "node-uid", Kind: "SBR", Name: "n", UID: "u", Generation: 3},
 		Completed:   true,
 	})
 	if err := s.Write(ctx, doc); err != nil {
@@ -330,124 +330,95 @@ func TestLoad_RoundTrip(t *testing.T) {
 	}
 }
 
-// TestCorruptQuarantine covers the recovery path: a damaged own file is moved
-// aside with its bytes intact, and the caller is handed a usable document plus
-// an explicit signal that history was lost.
-func TestCorruptQuarantine(t *testing.T) {
+// TestCorruptHistoryRetained requires uncertainty and original bytes to survive
+// repeated loads, new Store instances and housekeeping.
+func TestCorruptHistoryRetained(t *testing.T) {
 	t.Parallel()
-
-	corruptions := map[string]string{
-		"truncated json":    `{"schemaVersion":1,"node":"worker-0","rebo`,
-		"empty file":        ``,
-		"whitespace only":   "   \n\t ",
-		"not an object":     `["a","b"]`,
-		"trailing garbage":  `{"schemaVersion":1}{"schemaVersion":1}`,
-		"binary":            "\x00\x01\x02\x03",
-		"wrong field types": `{"schemaVersion":"one"}`,
-	}
-
-	for name, content := range corruptions {
-		name, content := name, content
-		t.Run(name, func(t *testing.T) {
-			t.Parallel()
-
-			s, dir := newStore(t, nodestate.ComponentSBR)
-			path := filepath.Join(dir, nodestate.SBRFile)
-			if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+	for _, raw := range []string{"", "{", `{"schemaVersion":1,"node":42}`, `{"schemaVersion":1} garbage`} {
+		s, dir := newStore(t, nodestate.ComponentSBR)
+		path := filepath.Join(dir, nodestate.SBRFile)
+		mustWrite(t, path, raw)
+		for i := 0; i < 3; i++ {
+			restarted, _ := nodestate.New(nodestate.ComponentSBR, nodestate.WithDir(dir))
+			res, err := restarted.Load(context.Background())
+			if err != nil || res.Status != nodestate.StatusCorrupt || !res.HistoryLost() {
+				t.Fatalf("classification lost: %+v %v", res, err)
+			}
+			if res.QuarantinePath != "" {
+				t.Fatal("automatic recovery moved evidence")
+			}
+			if _, err := s.Cleanup(context.Background()); err != nil {
 				t.Fatal(err)
 			}
-
-			res, err := s.Load(context.Background())
-			if err != nil {
-				t.Fatalf("Load: %v", err)
+			after, err := os.ReadFile(path)
+			if err != nil || string(after) != raw {
+				t.Fatal("original evidence changed")
 			}
-			if res.Status != nodestate.StatusRecovered {
-				t.Fatalf("Status = %v, want StatusRecovered", res.Status)
-			}
-			if !res.HistoryLost() {
-				t.Error("HistoryLost() = false, want true")
-			}
-			if res.Cause == nil {
-				t.Error("Cause is nil; the caller needs it for the event it must emit")
-			}
-			if res.Document == nil || len(res.Document.Reboots) != 0 {
-				t.Fatalf("Document = %+v, want a fresh one", res.Document)
-			}
-			if _, err := os.Stat(path); !errors.Is(err, fs.ErrNotExist) {
-				t.Errorf("the corrupt file is still in place: %v", err)
-			}
-			if res.QuarantinePath == "" {
-				t.Fatal("QuarantinePath is empty")
-			}
-			if !strings.HasSuffix(res.QuarantinePath, ".corrupt") {
-				t.Errorf("QuarantinePath = %q, want a *.corrupt suffix", res.QuarantinePath)
-			}
-			saved, err := os.ReadFile(res.QuarantinePath)
-			if err != nil {
-				t.Fatalf("read quarantine: %v", err)
-			}
-			if string(saved) != content {
-				t.Errorf("quarantined bytes = %q, want %q: the evidence must be preserved byte for byte", saved, content)
-			}
-		})
+		}
 	}
 }
 
-func TestCorruptQuarantine_SubsequentWriteSucceeds(t *testing.T) {
-	t.Parallel()
-
+func TestCorruptHistoryRequiresExplicitReconciliation(t *testing.T) {
 	s, dir := newStore(t, nodestate.ComponentSBR)
 	ctx := context.Background()
-	if err := os.WriteFile(filepath.Join(dir, nodestate.SBRFile), []byte(`{`), 0o600); err != nil {
+	mustWrite(t, filepath.Join(dir, nodestate.SBRFile), "{")
+	called := false
+	_, err := s.Update(ctx, func(d *nodestate.Document) error { called = true; return nil })
+	if !errors.Is(err, nodestate.ErrHistoryUnknown) || called {
+		t.Fatalf("unknown history mutated: %v", err)
+	}
+	if err := s.Write(ctx, nodestate.NewDocument(nodestate.ComponentSBR)); !errors.Is(err, nodestate.ErrHistoryUnknown) {
 		t.Fatal(err)
 	}
-
-	doc, err := s.Update(ctx, func(d *nodestate.Document) error {
+	_, err = s.ReconcileHistory(ctx, "test: owner and budget reconciled", func(r *nodestate.LoadResult) (*nodestate.Document, error) {
+		if r.Status != nodestate.StatusCorrupt {
+			t.Fatal(r.Status)
+		}
+		d := nodestate.NewDocument(nodestate.ComponentSBR)
 		d.Node = "worker-0"
-		return nil
+		return d, nil
 	})
 	if err != nil {
-		t.Fatalf("Update after corruption: %v", err)
-	}
-	if doc.Node != "worker-0" {
-		t.Errorf("Node = %q", doc.Node)
-	}
-
-	res, err := s.Load(ctx)
-	if err != nil {
 		t.Fatal(err)
 	}
-	if res.Status != nodestate.StatusOK || res.Document.Node != "worker-0" {
-		t.Errorf("after recovery: status %v, doc %+v", res.Status, res.Document)
+	// Reconciled history is usable, and says so: StatusRecovered is trusted,
+	// but it records that these facts were supplied by an operator rather
+	// than accumulated by the agent.
+	res, err := s.Load(ctx)
+	if err != nil || res.Status != nodestate.StatusRecovered || res.Document.Node != "worker-0" {
+		t.Fatalf("%+v %v", res, err)
+	}
+	if res.HistoryUncertain() {
+		t.Error("reconciled history still blocks execution")
+	}
+	if !res.HistoryReconstructed() {
+		t.Error("the reconstruction is not reported")
+	}
+	if _, err := s.Update(ctx, func(d *nodestate.Document) error { d.BootID = "boot-b"; return nil }); err != nil {
+		t.Errorf("Update on reconciled history: %v", err)
 	}
 }
 
-func TestCorruptQuarantine_RetainsABoundedNumberOfFiles(t *testing.T) {
-	t.Parallel()
-
-	s, dir := newStore(t, nodestate.ComponentSBR, nodestate.WithHousekeeping(nodestate.HousekeepingPolicy{QuarantineRetention: 2}))
-	ctx := context.Background()
+func TestCorruptHistoryDoesNotAccumulateArchives(t *testing.T) {
+	s, dir := newStore(t, nodestate.ComponentSBR)
 	path := filepath.Join(dir, nodestate.SBRFile)
-
+	mustWrite(t, path, "{bad")
 	for i := 0; i < 5; i++ {
-		if err := os.WriteFile(path, []byte("{bad"), 0o600); err != nil {
+		if _, err := s.Load(context.Background()); err != nil {
 			t.Fatal(err)
 		}
-		if _, err := s.Load(ctx); err != nil {
-			t.Fatalf("Load %d: %v", i, err)
-		}
 	}
-
-	matches, err := filepath.Glob(filepath.Join(dir, "*.corrupt"))
-	if err != nil {
-		t.Fatal(err)
+	matches, _ := filepath.Glob(filepath.Join(dir, "*.corrupt"))
+	if len(matches) != 0 {
+		t.Fatal("Load should preserve the live file without accumulating archives")
 	}
-	if len(matches) != 2 {
-		t.Errorf("got %d quarantine files, want 2: a boot loop must not fill the host path (%v)", len(matches), matches)
+	raw, _ := os.ReadFile(path)
+	if string(raw) != "{bad" {
+		t.Fatal("history changed")
 	}
 }
 
-func TestLoad_SchemaTooNewIsQuarantinedNotInterpreted(t *testing.T) {
+func TestLoad_SchemaTooNewIsRetainedNotInterpreted(t *testing.T) {
 	t.Parallel()
 
 	s, dir := newStore(t, nodestate.ComponentSBR)
@@ -472,7 +443,7 @@ func TestLoad_SchemaTooNewIsQuarantinedNotInterpreted(t *testing.T) {
 	if len(res.Document.Reboots) != 0 {
 		t.Error("records from an unsupported schema version must not be interpreted")
 	}
-	saved, err := os.ReadFile(res.QuarantinePath)
+	saved, err := os.ReadFile(filepath.Join(dir, nodestate.SBRFile))
 	if err != nil {
 		t.Fatalf("read quarantine: %v", err)
 	}
@@ -499,26 +470,16 @@ func TestLoad_SchemaTooOldIsRejected(t *testing.T) {
 }
 
 func TestLoad_RefusesAnOversizedFile(t *testing.T) {
-	t.Parallel()
-
 	s, dir := newStore(t, nodestate.ComponentSBR, nodestate.WithMaxReadBytes(1024))
-	big := make([]byte, 4096)
-	for i := range big {
-		big[i] = 'x'
-	}
-	if err := os.WriteFile(filepath.Join(dir, nodestate.SBRFile), big, 0o600); err != nil {
+	path := filepath.Join(dir, nodestate.SBRFile)
+	raw := strings.Repeat("x", 4096)
+	mustWrite(t, path, raw)
+	if _, err := s.Load(context.Background()); !errors.Is(err, nodestate.ErrTooLarge) {
 		t.Fatal(err)
 	}
-
-	res, err := s.Load(context.Background())
-	if err != nil {
-		t.Fatalf("Load: %v", err)
-	}
-	if res.Status != nodestate.StatusRecovered {
-		t.Fatalf("Status = %v, want StatusRecovered", res.Status)
-	}
-	if !errors.Is(res.Cause, nodestate.ErrTooLarge) {
-		t.Errorf("Cause = %v, want ErrTooLarge", res.Cause)
+	after, _ := os.ReadFile(path)
+	if string(after) != raw {
+		t.Fatal("oversized file was changed")
 	}
 }
 
@@ -668,7 +629,7 @@ func TestReadAll_MergesWhatItCanAndSkipsTheRest(t *testing.T) {
 		t.Errorf("ReadAll quarantined files: %v", matches)
 	}
 
-	// With no components named, it reads the known set.
+	// With no components named, it reads only its own file.
 	if got := s.ReadAll(ctx); len(got) != 1 {
 		t.Errorf("ReadAll() with no arguments returned %d documents, want 1", len(got))
 	}
@@ -680,6 +641,7 @@ func TestUpdate_AppliesRetentionAndPersists(t *testing.T) {
 	clk := nodestatetest.NewFakeClock(time.Date(2024, 6, 1, 0, 0, 0, 0, time.UTC))
 	s, _ := newStore(t, nodestate.ComponentSBR, nodestate.WithClock(clk))
 	ctx := context.Background()
+	mustInitialize(t, s)
 
 	for i := 0; i < 150; i++ {
 		if _, err := s.Update(ctx, func(d *nodestate.Document) error {
@@ -698,8 +660,8 @@ func TestUpdate_AppliesRetentionAndPersists(t *testing.T) {
 	if len(doc.IO) != nodestate.DefaultMaxIOEntries {
 		t.Errorf("IO has %d entries, want %d", len(doc.IO), nodestate.DefaultMaxIOEntries)
 	}
-	if doc.Revision != 150 {
-		t.Errorf("Revision = %d, want 150", doc.Revision)
+	if doc.Revision != 151 {
+		t.Errorf("Revision = %d, want 151", doc.Revision)
 	}
 }
 
@@ -709,6 +671,7 @@ func TestUpdate_ErrNoChangeSkipsTheWrite(t *testing.T) {
 	rec := nodestatetest.NewRecordingFS(nodestatetest.OSFileSystem())
 	s, _ := newStore(t, nodestate.ComponentSBR, nodestate.WithFileSystem(rec))
 	ctx := context.Background()
+	mustInitialize(t, s)
 
 	if _, err := s.Update(ctx, func(d *nodestate.Document) error { return nil }); err != nil {
 		t.Fatal(err)
@@ -733,8 +696,9 @@ func TestUpdate_ErrNoChangeSkipsTheWrite(t *testing.T) {
 func TestUpdate_MutatorErrorAbortsWithoutWriting(t *testing.T) {
 	t.Parallel()
 
-	s, dir := newStore(t, nodestate.ComponentSBR)
+	s, _ := newStore(t, nodestate.ComponentSBR)
 	ctx := context.Background()
+	mustInitialize(t, s)
 
 	sentinel := errors.New("caller decided not to proceed")
 	_, err := s.Update(ctx, func(d *nodestate.Document) error {
@@ -744,8 +708,9 @@ func TestUpdate_MutatorErrorAbortsWithoutWriting(t *testing.T) {
 	if !errors.Is(err, sentinel) {
 		t.Fatalf("Update error = %v, want the mutator's error", err)
 	}
-	if _, statErr := os.Stat(filepath.Join(dir, nodestate.SBRFile)); !errors.Is(statErr, fs.ErrNotExist) {
-		t.Error("a failed mutator must not leave a written file")
+	doc, err := s.Read(ctx)
+	if err != nil || doc.Node == "half-applied" {
+		t.Fatalf("failed mutation changed state: %+v, %v", doc, err)
 	}
 }
 
@@ -763,6 +728,7 @@ func TestUpdate_ReportsForeignModification(t *testing.T) {
 
 	s, dir := newStore(t, nodestate.ComponentSBR)
 	ctx := context.Background()
+	mustInitialize(t, s)
 
 	if _, err := s.Update(ctx, func(d *nodestate.Document) error { d.Node = "worker-0"; return nil }); err != nil {
 		t.Fatal(err)
@@ -812,6 +778,7 @@ func TestUpdate_NeverRefusesOnAForeignWrite(t *testing.T) {
 
 	s, dir := newStore(t, nodestate.ComponentSBR)
 	ctx := context.Background()
+	mustInitialize(t, s)
 
 	if _, err := s.Update(ctx, func(d *nodestate.Document) error { d.Node = "worker-0"; return nil }); err != nil {
 		t.Fatal(err)
@@ -870,7 +837,7 @@ func TestStatusString(t *testing.T) {
 	t.Parallel()
 
 	for _, st := range []nodestate.Status{
-		nodestate.StatusOK, nodestate.StatusAbsent, nodestate.StatusRecovered, nodestate.StatusIncompatible,
+		nodestate.StatusOK, nodestate.StatusAbsent, nodestate.StatusCorrupt, nodestate.StatusIncompatible,
 	} {
 		if s := st.String(); s == "" || strings.HasPrefix(s, "Status(") {
 			t.Errorf("Status(%d).String() = %q", int(st), s)
@@ -884,6 +851,14 @@ func TestStatusString(t *testing.T) {
 func mustWrite(t *testing.T, path, content string) {
 	t.Helper()
 	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// mustInitialize is used only for tests that start with a deliberately empty fixture.
+func mustInitialize(t *testing.T, s *nodestate.Store) {
+	t.Helper()
+	if err := s.Write(context.Background(), nodestate.NewDocument(s.Self())); err != nil {
 		t.Fatal(err)
 	}
 }

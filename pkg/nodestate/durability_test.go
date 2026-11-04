@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"os"
+	"strings"
 	"testing"
 	"time"
 
@@ -14,12 +15,8 @@ import (
 // TestSyncDirFailureIsNotALostWrite is the one error from a write that does
 // not mean "nothing was written".
 //
-// Once the rename has happened every reader sees the new version and there is
-// nothing to roll back to. Reporting that as a plain failure invites the
-// opposite conclusion, and for an agent that records a pending fence before
-// issuing it, the opposite conclusion is the dangerous one: it withholds the
-// fence while the record saying it committed is already on disk, where the
-// next boot reads it as a reboot that happened and was never confirmed.
+// Once rename succeeds the candidate is visible, but a failed directory sync
+// must block new reset authorization until the exact candidate is confirmed.
 func TestSyncDirFailureIsNotALostWrite(t *testing.T) {
 	t.Parallel()
 
@@ -34,7 +31,7 @@ func TestSyncDirFailureIsNotALostWrite(t *testing.T) {
 	doc.Node = "worker-0"
 	doc.AppendReboot(nodestate.RebootEntry{
 		TS: time.Now(), Source: nodestate.ComponentSBR, Reason: "pending-fence",
-		Remediation: &nodestate.CRRef{UID: "uid-1", Generation: 1},
+		Remediation: &nodestate.CRRef{NodeUID: "node-uid", UID: "uid-1", Generation: 1},
 	})
 
 	err := s.Write(ctx, doc)
@@ -98,17 +95,18 @@ func TestRevisionAdvancesPastAnUnconfirmedWrite(t *testing.T) {
 }
 
 // TestUpdateReturnsTheDocumentWithAnUnconfirmedWrite: the caller needs to see
-// what it recorded, because it is going to act on it.
+// what it recorded so it can confirm that exact candidate before acting.
 func TestUpdateReturnsTheDocumentWithAnUnconfirmedWrite(t *testing.T) {
 	t.Parallel()
 
 	faulty := nodestatetest.NewFaultyFS(nodestate.OSFileSystem())
 	s, _ := newStore(t, nodestate.ComponentSBR, nodestate.WithFileSystem(faulty))
 	ctx := context.Background()
+	mustInitialize(t, s)
 
-	faulty.FailOnce(nodestatetest.OpSyncDir, errors.New("EIO"))
 	doc, err := s.Update(ctx, func(d *nodestate.Document) error {
-		d.Agent.FenceLatched = true
+		faulty.FailOnce(nodestatetest.OpSyncDir, errors.New("EIO"))
+		d.Agent.ResetCommitted = true
 		return nil
 	})
 	if !errors.Is(err, nodestate.ErrDurabilityUnconfirmed) {
@@ -117,7 +115,7 @@ func TestUpdateReturnsTheDocumentWithAnUnconfirmedWrite(t *testing.T) {
 	if doc == nil {
 		t.Fatal("Update returned a nil document; the caller cannot see what it just committed to")
 	}
-	if !doc.Agent.FenceLatched {
+	if !doc.Agent.ResetCommitted {
 		t.Error("the returned document does not carry the mutation")
 	}
 }
@@ -146,6 +144,9 @@ func TestFailuresBeforeTheRenameAreLostWrites(t *testing.T) {
 				t.Fatal(err)
 			}
 
+			faulty.OnlyFailWhen(func(r nodestatetest.Record) bool {
+				return r.Op != nodestatetest.OpClose || strings.Contains(r.Path, ".tmp-")
+			})
 			faulty.FailOnce(failAt, errors.New("injected"))
 			next := good.Clone()
 			next.Node = "should-not-land"
@@ -155,7 +156,7 @@ func TestFailuresBeforeTheRenameAreLostWrites(t *testing.T) {
 			}
 			if errors.Is(err, nodestate.ErrDurabilityUnconfirmed) {
 				t.Fatalf("a failure at %s reports as ErrDurabilityUnconfirmed; "+
-					"the caller would act on a record that is not on disk", failAt)
+					"the caller would try to confirm a candidate that is not on disk", failAt)
 			}
 
 			back, readErr := s.Read(ctx)

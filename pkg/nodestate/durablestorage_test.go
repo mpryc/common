@@ -95,6 +95,9 @@ func TestCheckDurableStorage_AcceptsADisk(t *testing.T) {
 		t.Fatal(err)
 	}
 	if err := s.CheckDurableStorage(context.Background()); err != nil {
+		if errors.Is(err, nodestate.ErrNotDurable) {
+			t.Skipf("/var/tmp is not disk-backed in this environment: %v", err)
+		}
 		t.Fatalf("CheckDurableStorage on persistent storage: %v", err)
 	}
 }

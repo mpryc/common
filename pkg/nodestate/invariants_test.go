@@ -3,10 +3,10 @@ package nodestate_test
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
-	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -54,7 +54,7 @@ func TestRetentionFitsTheWriteLimit(t *testing.T) {
 		doc.AppendReboot(nodestate.RebootEntry{
 			TS: now, Source: nodestate.ComponentSNR, Method: nodestate.MethodSoftware,
 			Reason: "RemediationCR", EpisodeID: "6f0c6c1e-3f3a-4f1f-9c1e-2b1d4a5e6f70",
-			Remediation: &nodestate.CRRef{
+			Remediation: &nodestate.CRRef{NodeUID: "node-uid",
 				Kind: "SelfNodeRemediation", Namespace: "openshift-workload-availability",
 				Name: "worker-0.example.openshift.local",
 				UID:  "6f0c6c1e-3f3a-4f1f-9c1e-2b1d4a5e6f70", Generation: 3,
@@ -114,6 +114,7 @@ func TestTwoStoresOnOneFileDoNotLoseUpdates(t *testing.T) {
 		all[i] = s
 	}
 
+	mustInitialize(t, all[0])
 	var wg sync.WaitGroup
 	errs := make(chan error, stores)
 	for i, s := range all {
@@ -147,8 +148,8 @@ func TestTwoStoresOnOneFileDoNotLoseUpdates(t *testing.T) {
 	}
 	// Each Store sees the others' revisions on disk, so the sequence advances
 	// once per write and never repeats.
-	if doc.Revision != uint64(stores*perStore) {
-		t.Errorf("Revision = %d, want %d", doc.Revision, stores*perStore)
+	if doc.Revision != uint64(stores*perStore+1) {
+		t.Errorf("Revision = %d, want %d", doc.Revision, stores*perStore+1)
 	}
 }
 
@@ -170,6 +171,8 @@ func TestStoresOnDifferentFilesDoNotBlockEachOther(t *testing.T) {
 	// Holding one store's lock inside its mutator must not stop the other
 	// making progress; if the lock were global rather than per file, this
 	// would deadlock.
+	mustInitialize(t, sbr)
+	mustInitialize(t, snr)
 	release := make(chan struct{})
 	done := make(chan error, 1)
 	go func() {
@@ -189,49 +192,22 @@ func TestStoresOnDifferentFilesDoNotBlockEachOther(t *testing.T) {
 	}
 }
 
-// TestRecoveryIsRecordedInTheDocument closes the gap between Load, which
-// classifies, and Read and Update, which do not. An agent that only ever
-// calls Update must still end up with something in the file saying its
-// history was thrown away.
-func TestRecoveryIsRecordedInTheDocument(t *testing.T) {
-	t.Parallel()
-
+// TestRecoveryRequiresExplicitReconciliation ensures ordinary reads and updates
+// cannot conceal unusable history by returning a fresh usable document.
+func TestRecoveryRequiresExplicitReconciliation(t *testing.T) {
 	s, dir := newStore(t, nodestate.ComponentSBR)
-	ctx := context.Background()
-	mustWrite(t, filepath.Join(dir, nodestate.SBRFile), "{truncated")
-
-	doc, err := s.Update(ctx, func(d *nodestate.Document) error {
-		d.Node = "worker-0"
-		return nil
-	})
-	if err != nil {
+	path := filepath.Join(dir, nodestate.SBRFile)
+	mustWrite(t, path, "{truncated")
+	_, err := s.Update(context.Background(), func(d *nodestate.Document) error { t.Fatal("mutator ran"); return nil })
+	if !errors.Is(err, nodestate.ErrHistoryUnknown) {
 		t.Fatal(err)
 	}
-
-	var found *nodestate.EventEntry
-	for i := range doc.Events {
-		if doc.Events[i].Reason == nodestate.EventReasonStateFileRecovered {
-			found = &doc.Events[i]
-		}
+	raw, _ := os.ReadFile(path)
+	if string(raw) != "{truncated" {
+		t.Fatal("evidence lost")
 	}
-	if found == nil {
-		t.Fatalf("no %s event in %+v: Update recovered the file silently",
-			nodestate.EventReasonStateFileRecovered, doc.Events)
-	}
-	if found.Type != "Warning" {
-		t.Errorf("event type = %q, want Warning", found.Type)
-	}
-	if !strings.Contains(found.Message, ".corrupt") {
-		t.Errorf("event message %q does not name the quarantine file", found.Message)
-	}
-
-	// And it is durable, not just present in the returned copy.
-	reread, err := s.Read(ctx)
-	if err != nil {
+	if _, err := s.Read(context.Background()); !errors.Is(err, nodestate.ErrHistoryUnknown) {
 		t.Fatal(err)
-	}
-	if len(reread.Events) == 0 || reread.Events[0].Reason != nodestate.EventReasonStateFileRecovered {
-		t.Errorf("the recovery event did not reach the file: %+v", reread.Events)
 	}
 }
 

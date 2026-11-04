@@ -228,6 +228,7 @@ func TestConcurrentUpdate_NoLostUpdateWithinAProcess(t *testing.T) {
 
 	s, _ := newStore(t, nodestate.ComponentSBR)
 	ctx := context.Background()
+	mustInitialize(t, s)
 
 	const goroutines, perGoroutine = 8, 25
 
@@ -271,8 +272,8 @@ func TestConcurrentUpdate_NoLostUpdateWithinAProcess(t *testing.T) {
 	if len(doc.Events) != want {
 		t.Errorf("got %d events, want %d: Update must serialise read-modify-write within a process", len(doc.Events), want)
 	}
-	if doc.Revision != uint64(goroutines*perGoroutine) {
-		t.Errorf("Revision = %d, want %d", doc.Revision, goroutines*perGoroutine)
+	if doc.Revision != uint64(goroutines*perGoroutine+1) {
+		t.Errorf("Revision = %d, want %d", doc.Revision, goroutines*perGoroutine+1)
 	}
 }
 

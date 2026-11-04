@@ -22,6 +22,7 @@ func TestClockStepForwardDoesNotEraseHistory(t *testing.T) {
 	clk := nodestatetest.NewFakeClock(start)
 	s, _ := newStore(t, nodestate.ComponentSBR, nodestate.WithClock(clk))
 	ctx := context.Background()
+	mustInitialize(t, s)
 
 	for i := 0; i < 3; i++ {
 		if _, err := s.Update(ctx, func(d *nodestate.Document) error {
@@ -81,23 +82,16 @@ func TestClockStepForwardDoesNotEraseHistory(t *testing.T) {
 	}
 }
 
-// TestHorizonInTheFutureIsDiscarded covers a file written by a build that had
-// the defect above, or by any pass that ran against a wrong clock.
-func TestHorizonInTheFutureIsDiscarded(t *testing.T) {
-	t.Parallel()
-
+// TestHorizonSurvivesClockRollback ensures clock correction cannot restore
+// records that were discarded while the clock was ahead.
+func TestHorizonSurvivesClockRollback(t *testing.T) {
 	now := time.Date(2024, 6, 1, 12, 0, 0, 0, time.UTC)
 	doc := nodestate.NewDocument(nodestate.ComponentSBR)
-	doc.RebootHistoryCompleteSince = now.AddDate(5, 0, 0)
-	doc.AppendReboot(nodestate.RebootEntry{TS: now.Add(-time.Hour)})
-
+	horizon := now.AddDate(5, 0, 0)
+	doc.RebootHistoryCompleteSince = horizon
 	nodestate.DefaultRetention().Apply(doc, now)
-
-	if doc.RebootHistoryCompleteSince.After(now) {
-		t.Fatalf("horizon = %v, still in the future", doc.RebootHistoryCompleteSince)
-	}
-	if !nodestate.RebootHistoryComplete(now.Add(-24*time.Hour), doc) {
-		t.Error("the poisoned horizon did not self-heal")
+	if !doc.RebootHistoryCompleteSince.Equal(horizon) || nodestate.RebootHistoryComplete(now, doc) {
+		t.Fatal("clock rollback erased loss boundary")
 	}
 }
 
@@ -108,6 +102,7 @@ func TestClockGoingBackwardsIsRecorded(t *testing.T) {
 	clk := nodestatetest.NewFakeClock(start)
 	s, _ := newStore(t, nodestate.ComponentSBR, nodestate.WithClock(clk))
 	ctx := context.Background()
+	mustInitialize(t, s)
 
 	if _, err := s.Update(ctx, func(d *nodestate.Document) error { d.Node = "worker-0"; return nil }); err != nil {
 		t.Fatal(err)

@@ -177,6 +177,7 @@ func TestOptions_AcceptValidValues(t *testing.T) {
 		t.Fatalf("New: %v", err)
 	}
 
+	mustInitialize(t, s)
 	doc, err := s.Update(context.Background(), func(d *nodestate.Document) error {
 		for i := 0; i < 20; i++ {
 			d.AppendIO(nodestate.IOEntry{TS: clk.Now(), OK: true})
@@ -311,7 +312,7 @@ func TestMergeReboots_FillsGapsFromEitherWriter(t *testing.T) {
 	t.Parallel()
 
 	at := time.Date(2024, 8, 1, 0, 0, 0, 0, time.UTC)
-	ref := &nodestate.CRRef{UID: "uid-1", Generation: 1}
+	ref := &nodestate.CRRef{NodeUID: "node-uid", UID: "uid-1", Generation: 1}
 
 	sparse := nodestate.NewDocument(nodestate.ComponentSBR)
 	sparse.AppendReboot(nodestate.RebootEntry{TS: at, Remediation: ref})

@@ -148,13 +148,7 @@ func (p RetentionPolicy) Apply(d *Document, now time.Time) {
 		return
 	}
 
-	// A completeness point later than the present cannot be true: it would
-	// claim the history begins in the future. Reaching here means an earlier
-	// pass ran against a clock that was wrong, so discard the claim and let
-	// this pass derive a fresh one.
-	if d.RebootHistoryCompleteSince.After(now) {
-		d.RebootHistoryCompleteSince = time.Time{}
-	}
+	// A backward clock step cannot restore discarded records. Keep the horizon.
 	p.noteClockRegression(d, now)
 
 	d.IO = tail(d.IO, p.MaxIOEntries)
@@ -211,7 +205,7 @@ func (p RetentionPolicy) trimRebootsByAge(d *Document, now time.Time) {
 	clearTail(d.Reboots, 0)
 	d.Reboots = keep
 	if len(dropped) > 0 {
-		advanceHorizon(d, oldestRetained(d, now))
+		advanceDroppedHorizon(d, dropped, now)
 	}
 }
 
@@ -221,23 +215,30 @@ func (p RetentionPolicy) trimRebootsByCount(d *Document, now time.Time) {
 		return
 	}
 	drop := len(d.Reboots) - p.MaxRebootEntries
+	dropped := append([]RebootEntry(nil), d.Reboots[:drop]...)
 	d.Reboots = append(d.Reboots[:0], d.Reboots[drop:]...)
 	clearTail(d.Reboots[:cap(d.Reboots)], len(d.Reboots))
-	advanceHorizon(d, oldestRetained(d, now))
+	advanceDroppedHorizon(d, dropped, now)
 }
 
-// oldestRetained returns the timestamp from which the surviving records are
-// known to be complete: the oldest one still held, or now when none are.
-//
-// An entry with no timestamp is skipped, because it cannot support a claim
-// about when the history begins.
-func oldestRetained(d *Document, now time.Time) time.Time {
+// Inclusive queries at a discarded timestamp are incomplete. Start strictly
+// after the newest discarded timestamp; also retain the prior conservative
+// oldest-retained boundary. Unknown timestamps make completeness unknowable.
+func advanceDroppedHorizon(d *Document, dropped []RebootEntry, now time.Time) {
+	for _, r := range dropped {
+		if r.TS.IsZero() {
+			d.RebootHistoryUnknown = true
+			continue
+		}
+		advanceHorizon(d, r.TS.Add(time.Nanosecond))
+	}
 	for _, r := range d.Reboots {
 		if !r.TS.IsZero() {
-			return r.TS
+			advanceHorizon(d, r.TS)
+			return
 		}
 	}
-	return now
+	advanceHorizon(d, now)
 }
 
 // advanceHorizon moves the completeness point forward, never backward, and
@@ -331,7 +332,7 @@ func RebootHistoryComplete(since time.Time, docs ...*Document) bool {
 		if d == nil {
 			continue
 		}
-		if d.RebootHistoryCompleteSince.After(since) {
+		if d.RebootHistoryUnknown || d.RebootHistoryCompleteSince.After(since) {
 			return false
 		}
 	}

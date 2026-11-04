@@ -8,15 +8,11 @@ import (
 // MergeReboots combines the reboot histories of several documents into one
 // list, oldest first, counting each remediation once.
 //
-// This is the function the two-file model exists for. With one file per
-// writer and no shared lock, "how many times has this node rebooted?" is
-// answered by reading every file and merging at read time. Two agents can
-// both record the same reboot — the self-node-remediation agent writes a
-// pending software reboot, the storage agent records the watchdog release
-// that actually carried it out — and that is one reboot, not two. Counting it
-// twice would halve the node's effective budget.
+// This optional diagnostic aggregation works with one or more explicitly
+// selected documents. It does not require SBR and SNR to share history, and
+// is not an authoritative reset ledger or proof of execution ordering.
 //
-// Identity is the remediation resource's UID and generation. An entry with no
+// Identity is the remediation resource's UID and target Node UID. An entry with no
 // remediation reference is autonomous and is never collapsed with anything:
 // two independent self-fences are two reboots even if they look alike.
 //
@@ -85,6 +81,11 @@ func combineReboots(a, b RebootEntry) RebootEntry {
 
 	if !b.TS.IsZero() && (out.TS.IsZero() || b.TS.Before(out.TS)) {
 		out.TS = b.TS
+		if b.Remediation != nil {
+			ref := *b.Remediation
+			ref.Unknown = cloneRawMap(b.Remediation.Unknown)
+			out.Remediation = &ref
+		}
 	}
 	if out.EpisodeID == "" {
 		out.EpisodeID = b.EpisodeID
@@ -121,9 +122,9 @@ func rebootSortKey(e RebootEntry) string {
 // CountReboots returns the number of distinct reboots at or after since,
 // across every supplied document, optionally restricted by match.
 //
-// It is the primitive behind both budgets the design defines. The autonomous
-// budget counts entries with no remediation reference; the requested budget
-// counts entries that have one:
+// It counts retained diagnostic records, not the authoritative SBR budget.
+// SBR budgets use stable attempt IDs and unresolved outage epochs in retained
+// consumer state. Diagnostic records can still be filtered by origin:
 //
 //	autonomous := nodestate.CountReboots(windowStart,
 //	    func(r nodestate.RebootEntry) bool { return r.Remediation == nil },
@@ -154,11 +155,14 @@ func CountReboots(since time.Time, match func(RebootEntry) bool, docs ...*Docume
 //
 // It answers "has this remediation already been carried out on this node?",
 // which is how a restarted agent avoids rebooting twice for one request. The
-// answer is advisory: the state file is a node-local note, and the authority
-// for whether a node rebooted is node.Status.NodeInfo.BootID read from the
-// API. Use this to suppress a duplicate, never as the sole justification for
-// a destructive action.
+// answer is advisory: neither a diagnostic record nor raw Node boot status
+// establishes ordered completion. SBR requires an observation tied to the
+// Accepted Node execution, followed by peer validation and BootEnded.
+// Missing diagnostic history never grants another attempt.
 func FindReboot(ref CRRef, docs ...*Document) (RebootEntry, bool) {
+	if ref.Validate() != nil {
+		return RebootEntry{}, false
+	}
 	key := ref.Key()
 	var (
 		found RebootEntry

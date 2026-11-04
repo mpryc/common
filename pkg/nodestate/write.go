@@ -21,8 +21,8 @@ import (
 // rename is a cross-device copy and not atomic. The file sync must precede
 // the rename, or a crash can leave the directory pointing at a file with no
 // contents. The directory sync must follow it, or the rename itself can be
-// lost. On any failure the temporary file is removed and the previous version
-// of the target is untouched.
+// lost. Failures before rename leave the target unchanged. A directory-sync
+// failure after rename returns ErrDurabilityUnconfirmed: visible, not durable.
 func (s *Store) atomicReplace(path string, data []byte) error {
 	dir := filepath.Dir(path)
 	prefix := temporaryPrefix(filepath.Base(path))
@@ -63,17 +63,9 @@ func (s *Store) atomicReplace(path string, data []byte) error {
 	committed = true
 
 	if err := s.fs.SyncDir(dir); err != nil {
-		// Past the point of no return. The rename has happened, every reader
-		// already sees the new version, and there is nothing to roll back
-		// to. All that is unproven is whether the directory entry survives a
-		// power loss.
-		//
-		// This has to be a distinguishable outcome rather than a plain
-		// error, because the two readings lead to opposite actions. A caller
-		// that reads "the write failed" from here will conclude the record
-		// it was about to act on is not on disk — and for an agent that
-		// records a pending fence before issuing it, that is exactly
-		// backwards.
+		// The candidate is visible but not confirmed durable. Callers must
+		// resolve this outcome before authorizing a new action.
+
 		return fmt.Errorf("%w: %s was replaced but the directory entry could not be flushed: %w",
 			ErrDurabilityUnconfirmed, path, pathErrorf("fsync", dir, err))
 	}

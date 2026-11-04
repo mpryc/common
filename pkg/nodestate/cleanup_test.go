@@ -2,7 +2,6 @@ package nodestate_test
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -269,63 +268,26 @@ func TestHousekeepingNeverEndangersTheLiveDocument(t *testing.T) {
 	}
 }
 
-// TestPreservedMembersAreCapped closes a way to wedge the agent out of its
+// TestPreservedMembersOverLimitRefuseWithoutLoss closes a way to wedge the agent out of its
 // own file. Members this build does not recognise are carried forward
 // unconditionally, and the document has a write limit — so without a ceiling,
 // a peer with a bug, or anything else able to write the directory, could
 // leave behind a file this agent could read but never replace.
-func TestPreservedMembersAreCapped(t *testing.T) {
-	t.Parallel()
-
-	s, dir := newStore(t, nodestate.ComponentSBR, nodestate.WithHousekeeping(nodestate.HousekeepingPolicy{MaxPreservedBytes: 4 << 10}))
-	ctx := context.Background()
-
-	raw := map[string]interface{}{
-		"schemaVersion": 1,
-		"node":          "worker-0",
-		"agent":         map[string]string{"component": "sbr"},
-		"futureBallast": strings.Repeat("x", 64<<10),
-	}
-	encoded, err := json.Marshal(raw)
-	if err != nil {
+func TestPreservedMembersOverLimitRefuseWithoutLoss(t *testing.T) {
+	s, dir := newStore(t, nodestate.ComponentSBR, nodestate.WithHousekeeping(nodestate.HousekeepingPolicy{MaxPreservedBytes: 4096}))
+	raw := fmt.Sprintf(`{"schemaVersion":1,"futureBallast":%q}`, strings.Repeat("x", 64<<10))
+	path := filepath.Join(dir, nodestate.SBRFile)
+	mustWrite(t, path, raw)
+	if _, err := s.Load(context.Background()); !errors.Is(err, nodestate.ErrTooLarge) {
 		t.Fatal(err)
 	}
-	mustWrite(t, filepath.Join(dir, nodestate.SBRFile), string(encoded))
-
-	res, err := s.Load(ctx)
-	if err != nil {
+	_, err := s.Update(context.Background(), func(d *nodestate.Document) error { t.Fatal("mutator ran"); return nil })
+	if !errors.Is(err, nodestate.ErrTooLarge) {
 		t.Fatal(err)
 	}
-	if res.Status != nodestate.StatusOK {
-		t.Fatalf("Status = %v, want StatusOK: the document itself is valid", res.Status)
-	}
-	if len(res.Document.Unknown) != 0 {
-		t.Errorf("preserved members survived the cap: %v", keysOf(res.Document.Unknown))
-	}
-	if res.Document.Node != "worker-0" {
-		t.Error("the cap discarded a recognised field")
-	}
-
-	var dropped bool
-	for _, e := range res.Document.Events {
-		if e.Reason == nodestate.EventReasonPreservedFieldsDropped {
-			dropped = true
-			if e.Type != "Warning" {
-				t.Errorf("event type = %q, want Warning", e.Type)
-			}
-		}
-	}
-	if !dropped {
-		t.Errorf("no %s event: a staggered upgrade just lost data silently",
-			nodestate.EventReasonPreservedFieldsDropped)
-	}
-
-	// The agent can still write, which is the whole point.
-	if _, err := s.Update(ctx, func(d *nodestate.Document) error {
-		d.BootID = "8f1a2b3c-4d5e-6f70-8192-a3b4c5d6e7f8"
-		return nil
-	}); err != nil {
-		t.Fatalf("Update after the cap: %v", err)
+	after, _ := os.ReadFile(path)
+	if string(after) != raw {
+		t.Fatal("newer fields were discarded")
 	}
 }
 
@@ -366,17 +328,9 @@ func TestPreservedMembersCapCountsEveryLevel(t *testing.T) {
 	mustWrite(t, filepath.Join(dir, nodestate.SBRFile), fmt.Sprintf(
 		`{"schemaVersion":1,"agent":{"component":"sbr"},"reboots":[%s]}`, strings.Join(reboots, ",")))
 
-	res, err := s.Load(context.Background())
-	if err != nil {
+	_, err := s.Load(context.Background())
+	if !errors.Is(err, nodestate.ErrTooLarge) {
 		t.Fatal(err)
-	}
-	if len(res.Document.Reboots) != 40 {
-		t.Fatalf("got %d reboots, want 40: the records themselves must survive", len(res.Document.Reboots))
-	}
-	for i, r := range res.Document.Reboots {
-		if len(r.Unknown) != 0 {
-			t.Fatalf("reboots[%d] kept %v; nested members must count against the cap", i, keysOf(r.Unknown))
-		}
 	}
 }
 

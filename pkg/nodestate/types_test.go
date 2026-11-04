@@ -152,7 +152,7 @@ func TestDocument_Clone_IsDeep(t *testing.T) {
 	orig.AppendReboot(nodestate.RebootEntry{
 		TS:          time.Unix(1, 0).UTC(),
 		Source:      nodestate.ComponentSNR,
-		Remediation: &nodestate.CRRef{UID: "u", Generation: 1},
+		Remediation: &nodestate.CRRef{NodeUID: "node-uid", UID: "u", Generation: 1},
 	})
 
 	clone := orig.Clone()

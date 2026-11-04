@@ -46,6 +46,11 @@ func Example() {
 	}
 	fmt.Println("start-up:", res.Status, "history lost:", res.HistoryLost())
 
+	// This example owns a new temporary directory. Production requires live
+	// execution and budget checks before initializing missing history.
+	if err := store.Write(ctx, nodestate.NewDocument(store.Self())); err != nil {
+		panic(err)
+	}
 	_, err = store.Update(ctx, func(d *nodestate.Document) error {
 		d.Node = "worker-0"
 		d.BootID = "8f1a2b3c-4d5e-6f70-8192-a3b4c5d6e7f8"
@@ -67,12 +72,13 @@ func Example() {
 
 	// Output:
 	// start-up: Absent history lost: false
-	// node: worker-0 revision: 1
+	// node: worker-0 revision: 2
 }
 
 // ExampleStore_Update_recordAReboot shows the ordering a reboot record
-// requires: the intent is written and flushed before the reboot is issued, so
-// that a node which does not come back still leaves a trace of why.
+// requires. This is a diagnostic example for a hypothetical consumer, not an
+// execution protocol. SBR must reserve, confirm Node acceptance and persist
+// its latch and ledger before reset; a RebootEntry alone is insufficient.
 func ExampleStore_Update_recordAReboot() {
 	dir := exampleDir()
 	defer func() { _ = os.RemoveAll(dir) }()
@@ -80,11 +86,15 @@ func ExampleStore_Update_recordAReboot() {
 	ctx := context.Background()
 	store, _ := nodestate.New(nodestate.ComponentSNR, nodestate.WithDir(dir))
 
-	cr := nodestate.CRRef{
+	cr := nodestate.CRRef{NodeUID: "node-uid",
 		Kind: "SelfNodeRemediation", Namespace: "medik8s",
 		Name: "worker-0", UID: "6f0c6c1e-3f3a-4f1f-9c1e-2b1d4a5e6f70", Generation: 2,
 	}
 
+	// This example starts with a verified empty fixture.
+	if err := store.Write(ctx, nodestate.NewDocument(store.Self())); err != nil {
+		panic(err)
+	}
 	// Before the reboot: record the intent, not the outcome.
 	if _, err := store.Update(ctx, func(d *nodestate.Document) error {
 		d.AppendReboot(nodestate.RebootEntry{
@@ -127,12 +137,12 @@ func ExampleStore_Update_recordAReboot() {
 	// recorded: 1 pending: 0
 }
 
-// ExampleMergeReboots shows why both files are read. The self-remediation
-// agent records a software reboot it requested; the storage agent records the
-// watchdog release that actually carried it out. That is one reboot.
+// ExampleMergeReboots illustrates optional diagnostic aggregation for a
+// hypothetical integration with two writers. Current SBR uses only its own
+// journal and does not depend on SNR participation.
 func ExampleMergeReboots() {
 	at := time.Date(2024, 6, 1, 12, 0, 0, 0, time.UTC)
-	cr := &nodestate.CRRef{UID: "uid-1", Generation: 1}
+	cr := &nodestate.CRRef{NodeUID: "node-uid", UID: "uid-1", Generation: 1}
 
 	snr := nodestate.NewDocument(nodestate.ComponentSNR)
 	snr.AppendReboot(nodestate.RebootEntry{

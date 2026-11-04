@@ -17,9 +17,8 @@ import (
 //     what this library requires. Per the design, a host-path fault is evidence
 //     about this agent's bookkeeping, never about the cluster's storage.
 //   - Content faults (ErrCorrupt, ErrSchemaUnsupported, ErrTooLarge) are
-//     handled internally for the owner's own file, which is quarantined and
-//     recreated, and are invisible for a peer's file, which simply reads as
-//     absent.
+//     classified without replacing the owner's file. Peer readers report
+//     unusable or unsupported history without changing it.
 var (
 	// ErrInvalidComponent means a Component is not a safe, single path element.
 	ErrInvalidComponent = errors.New("nodestate: invalid component name")
@@ -62,19 +61,26 @@ var (
 	// read or on write. It bounds the memory a hostile or runaway file can cost.
 	ErrTooLarge = errors.New("nodestate: size limit exceeded")
 
+	// ErrHistoryUnknown blocks ordinary updates until history is reconciled.
+	ErrHistoryUnknown = errors.New("nodestate: history requires reconciliation")
+
+	// ErrStateChanged means a durability confirmation no longer identifies the live document.
+	ErrStateChanged = errors.New("nodestate: state changed before confirmation")
+
 	// ErrDurabilityUnconfirmed means the replacement is already visible to
-	// every reader but may not survive a power loss, because the directory
-	// entry could not be flushed after the rename.
+	// every reader but has not been shown to survive a crash, because the
+	// directory entry could not be flushed after the rename.
 	//
-	// It is the one error from a write that does NOT mean "nothing was
-	// written". A caller must treat the document as written: do not retry,
-	// and do not withhold an action that was waiting on the record being on
-	// disk. An agent that records a pending fence before issuing it should
-	// proceed with the fence.
+	// It MUST NOT authorize a new reset. The reset is itself the crash that
+	// would test this: issuing one on an unconfirmed record risks losing the
+	// very commitment that records it, and a lost commitment is an uncharged
+	// budget and a possible reset loop.
 	//
-	// What it does mean is that a power loss in the next few seconds could
-	// lose the record, so it is worth an event and a metric. Repeated
-	// occurrences indicate a failing host path.
+	// Nor does it mean nothing was written. The bytes are there, so do not
+	// rerun a non-idempotent mutator — resolve the exact candidate with
+	// ConfirmDurability instead. Load confirms surviving history after a
+	// restart, where this process cannot know what its predecessor achieved.
+	// A commitment established before this failure stays in force.
 	ErrDurabilityUnconfirmed = errors.New("nodestate: write is visible but its durability is unconfirmed")
 
 	// ErrForeignWrite means the file this Store owns was last written by
