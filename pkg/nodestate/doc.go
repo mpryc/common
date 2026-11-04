@@ -62,21 +62,31 @@
 // AppendRebootChecked rejects them for new writes.
 //
 // Reboots, IO, Events and Conditions are diagnostic collections with retention.
-// SBR stores schemaVersion, activeAttempt, resetBudget and outageState as
-// opaque strings in Agent.Extra. Its Node execution record owns acceptance,
-// cancellation and BootEnded; the local journal retains reservations, the
-// boot-bound latch and accounting. Common never prunes that map or interprets
-// consumer state machines. If required records do
-// not fit, writes fail with ErrTooLarge rather than dropping those records.
-// Unknown JSON fields survive supported read-modify-write cycles; exceeding a
-// configured preservation limit refuses the operation without deleting fields.
+// A consumer keeps its own required state as opaque strings in Agent.Extra:
+// its attempt identity, boot-bound commitment and reset accounting, versioned
+// by a key of its own. Common stores and returns those strings. It never
+// prunes that map, parses a consumer state machine, charges a budget or
+// infers that an attempt was accepted. If required records do not fit, writes
+// fail with ErrTooLarge rather than dropping them. Unknown JSON fields survive
+// supported read-modify-write cycles; exceeding a configured preservation
+// limit refuses the operation without deleting fields.
 //
-// Snapshot and ReadAll default to this Store's component only. SBR does not
-// depend on an SNR file. Other controllers can own independent files, and
-// callers can explicitly request several components.
+// Authority for whether a remediation was accepted, cancelled or completed
+// belongs to the consumer's API records, never to this file. The journal
+// retains reservations, commitments and accounting so that a restarted agent
+// can recognise what it already did.
+//
+// Snapshot and ReadAll default to this Store's component only. A file left by
+// an unrelated controller therefore cannot make this consumer's history
+// incomplete. Any controller may own an independent component, and a caller
+// that deliberately combines histories names every component it expects.
+// KnownComponents is a catalog of conventional names; it does not describe
+// what is installed and is not a required peer set.
+//
 // Snapshot retains failed or cancelled reads. HistoryComplete must be checked
 // before treating CountReboots as more than a lower bound. Even a syntactically
-// complete diagnostic history is not a replacement for the authoritative ledger.
+// complete diagnostic history is not a replacement for the consumer's own
+// authoritative budget records.
 // Pruning records with tied timestamps excludes the discarded timestamp from
 // the complete interval. A clock rollback cannot restore discarded history.
 //
