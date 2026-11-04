@@ -15,10 +15,22 @@ set -euo pipefail
 PACKAGES=(./pkg/nodestate/...)
 MODULE=$(go list -m)
 
+# Resolve the dependency list first. Folding this into the filtering pipeline
+# would let a build failure arrive as an empty list, which the filter then
+# reports as "no external dependencies" — the gate passing precisely when it
+# could not run.
+if ! deps=$(go list -deps "${PACKAGES[@]}"); then
+  echo "verify-nodestate-deps: go list failed; the dependency check did not run"
+  exit 1
+fi
+
+# Exempt only this package and its subpackages. Exempting the whole module
+# would let pkg/nodestate import another package from this repository and
+# still pass, which the package documentation says it does not do.
 external=$(
-  go list -deps "${PACKAGES[@]}" |
+  printf '%s\n' "$deps" |
     awk -F/ '$1 ~ /\./ { print }' |
-    grep -v "^${MODULE}\(/\|$\)" || true
+    grep -v "^${MODULE}/pkg/nodestate\(/\|$\)" || true
 )
 
 if [ -n "$external" ]; then

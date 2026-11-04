@@ -78,8 +78,15 @@ func TestMergeDoesNotCollapseUIDLessReferencesAlreadyOnDisk(t *testing.T) {
 	}
 }
 
-// TestAppendRebootRetainsUnresolvedRequestedReference keeps the bad reference off disk
-// in the first place.
+// TestAppendRebootRetainsUnresolvedRequestedReference pins what AppendReboot
+// does with a reference that cannot identify a request.
+//
+// It keeps it. The record stays a requested one and is never merged or
+// matched, so it cannot be charged twice and cannot be mistaken for an
+// autonomous reset the agent decided on alone. Discarding the reference
+// instead would move the record onto the autonomous budget, which is a
+// different allowance with different consequences on exhaustion.
+// AppendRebootChecked is the call that refuses such a reference outright.
 func TestAppendRebootRetainsUnresolvedRequestedReference(t *testing.T) {
 	t.Parallel()
 
@@ -90,10 +97,11 @@ func TestAppendRebootRetainsUnresolvedRequestedReference(t *testing.T) {
 	})
 
 	if doc.Reboots[0].Remediation == nil {
-		t.Errorf("an unresolved requested reference was discarded: %+v", doc.Reboots[0].Remediation)
+		t.Error("the unresolved requested reference was discarded; the record would " +
+			"then be charged to the autonomous budget instead")
 	}
 	if doc.Reboots[0].Reason != "no uid" {
-		t.Error("the record itself was discarded; only the reference should be")
+		t.Error("the record itself was discarded")
 	}
 
 	// A usable reference is kept untouched.

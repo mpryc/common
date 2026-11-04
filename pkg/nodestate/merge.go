@@ -139,7 +139,11 @@ func rebootSortKey(e RebootEntry) string {
 func CountReboots(since time.Time, match func(RebootEntry) bool, docs ...*Document) int {
 	n := 0
 	for _, entry := range MergeReboots(docs...) {
-		if entry.TS.Before(since) {
+		// A record with no timestamp counts in every window. Retention keeps
+		// it for the same reason it is counted here: an undated reset is more
+		// likely a writer that forgot to stamp it than one that never
+		// happened, and the safe direction for a budget is to count.
+		if !entry.TS.IsZero() && entry.TS.Before(since) {
 			continue
 		}
 		if match != nil && !match(entry) {

@@ -101,14 +101,15 @@ func (s Status) String() string {
 // LoadResult contains the classification, which must be checked before use.
 // A placeholder Document in a non-OK result is not trusted execution history.
 type LoadResult struct {
-	// Document is the loaded state when Status is StatusOK, and a placeholder
-	// otherwise. A placeholder is somewhere to write, not history to trust:
-	// treat it as such only after reconciliation.
+	// Document is the loaded state when Status.Trusted reports true, which
+	// covers StatusOK and StatusRecovered. For any other status it is a
+	// placeholder: somewhere to write, not history to trust, and only after
+	// reconciliation.
 	Document *Document
 
-	// Status says what was found. Branch on it. Every value other than
-	// StatusOK means ordinary mutation must wait, which is what
-	// HistoryUncertain reports.
+	// Status says what was found. Branch on it. Every value for which
+	// Status.Trusted reports false means ordinary mutation must wait, which
+	// is what HistoryUncertain reports.
 	Status Status
 
 	// Cause is why the contents could not be used, for StatusCorrupt,
@@ -714,11 +715,12 @@ func (s *Store) confirmLocked(doc *Document) error {
 
 // Read returns trusted current history, or an error.
 //
-// It fails closed. Anything other than StatusOK — absent, corrupt,
-// incompatible, durability unknown — comes back as ErrHistoryUnknown rather
-// than as an empty document, because "this node has never run" and "the
-// history is gone" lead to opposite decisions about a reset budget and must
-// never be confused.
+// It fails closed. Absent, corrupt, incompatible and durability-unknown
+// history all come back as ErrHistoryUnknown rather than as an empty
+// document, because "this node has never run" and "the history is gone" lead
+// to opposite decisions about a reset budget and must never be confused.
+// StatusOK and StatusRecovered are returned: both are trusted, the second
+// having been reconstructed rather than observed.
 //
 // Use Load at start-up, where the distinction between those cases is the
 // whole question. Use Read once history is known good.
@@ -877,6 +879,14 @@ const (
 	// means the peer is newer. Its reboots are missing from every budget
 	// until this side is upgraded too.
 	PeerUnsupportedSchema
+	// PeerNotCollected means the read never happened: the context was
+	// cancelled, or the component name was not usable.
+	//
+	// It is nobody's fault on the host. Keeping it separate from
+	// PeerUnreadable matters because that status tells a consumer to raise a
+	// deployment-fault condition — an SELinux denial or a wrong owner — and
+	// a cancelled context is neither. The history is still incomplete.
+	PeerNotCollected
 )
 
 // String implements fmt.Stringer.
@@ -892,6 +902,8 @@ func (p PeerStatus) String() string {
 		return "Unreadable"
 	case PeerUnsupportedSchema:
 		return "UnsupportedSchema"
+	case PeerNotCollected:
+		return "NotCollected"
 	default:
 		return fmt.Sprintf("PeerStatus(%d)", int(p))
 	}
@@ -1069,6 +1081,14 @@ func (s *Store) writeLocked(doc *Document) error {
 		return err
 	}
 	identity := processIdentity()
+	// Decoding normalizes an absent reboots array to an empty slice, so a
+	// hand-built document with a nil slice would encode differently from the
+	// same document read back. ConfirmDurability compares encodings, and the
+	// mismatch would surface as ErrStateChanged against the caller's own
+	// write — which reads as "another process touched this file".
+	if doc.Reboots == nil {
+		doc.Reboots = []RebootEntry{}
+	}
 	doc.SchemaVersion = Schema
 	doc.Agent.Component = s.self
 	doc.Agent.PID = identity.PID

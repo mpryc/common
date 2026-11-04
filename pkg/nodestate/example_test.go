@@ -21,7 +21,13 @@ func exampleDir() string {
 	if err := os.Chmod(dir, 0o700); err != nil {
 		panic(err)
 	}
-	return dir
+	// The package refuses a state directory reached through a symlink, and a
+	// temporary directory is one on macOS, where they sit under /var.
+	resolved, err := filepath.EvalSymlinks(dir)
+	if err != nil {
+		panic(err)
+	}
+	return resolved
 }
 
 // Example shows the shape of an agent's use of the package: construct a

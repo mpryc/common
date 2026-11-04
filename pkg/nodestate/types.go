@@ -550,6 +550,14 @@ func (d *Document) SetCondition(c ConditionEntry) {
 		if d.Conditions[i].Status == c.Status && !d.Conditions[i].LastTransitionTime.IsZero() {
 			c.LastTransitionTime = d.Conditions[i].LastTransitionTime
 		}
+		// Carry forward members a newer peer added to this condition. The
+		// package promises unknown fields survive a read-modify-write, and
+		// replacing the entry wholesale would break that promise for the one
+		// collection whose entries are replaced rather than appended. An
+		// explicit value on the replacement still wins.
+		if c.Unknown == nil {
+			c.Unknown = d.Conditions[i].Unknown
+		}
 		d.Conditions[i] = c
 		return
 	}

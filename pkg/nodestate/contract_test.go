@@ -281,6 +281,7 @@ func TestContract_PeerVocabulary(t *testing.T) {
 		nodestate.PeerUnusable:          "Unusable",
 		nodestate.PeerUnreadable:        "Unreadable",
 		nodestate.PeerUnsupportedSchema: "UnsupportedSchema",
+		nodestate.PeerNotCollected:      "NotCollected",
 	}
 	for status, name := range want {
 		if got := status.String(); got != name {
@@ -495,5 +496,141 @@ func TestContract_RecoveredHistoryIsTrustedAndSelfClearing(t *testing.T) {
 	}
 	if later.Status != nodestate.StatusOK {
 		t.Errorf("status = %v after the retention window; the mark did not clear", later.Status)
+	}
+}
+
+// TestContract_CancellationIsNotADeploymentFault separates "the read never
+// happened" from "the file is there and this host will not let me read it".
+//
+// Only the second warrants the condition a consumer raises on
+// PeerRead.Configured, because only the second needs someone to go and fix a
+// mount, an owner or an SELinux label. Reporting a cancelled context that way
+// sends an operator looking for a problem that is not there.
+func TestContract_CancellationIsNotADeploymentFault(t *testing.T) {
+	t.Parallel()
+
+	s, _ := newStore(t, nodestate.ComponentSBR)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	snap := s.Snapshot(ctx)
+	read := snap.Peers[nodestate.ComponentSBR]
+	if read == nil {
+		t.Fatal("the uncollected component was not recorded at all")
+	}
+	if read.Status != nodestate.PeerNotCollected {
+		t.Errorf("Status = %v, want PeerNotCollected", read.Status)
+	}
+	if read.Configured() {
+		t.Error("a cancelled context reported as a deployment fault")
+	}
+
+	// It still leaves the history incomplete, which is the half that matters
+	// for a budget.
+	if snap.HistoryComplete(time.Now().Add(-time.Hour)) {
+		t.Error("HistoryComplete = true for a snapshot that read nothing")
+	}
+	if got := snap.Missing(); len(got) != 1 || got[0] != nodestate.ComponentSBR {
+		t.Errorf("Missing() = %v", got)
+	}
+	if snap.Err == nil {
+		t.Error("Err was not recorded")
+	}
+
+	// A genuine access failure keeps reporting as one.
+	if nodestate.PeerUnreadable == nodestate.PeerNotCollected {
+		t.Fatal("the two statuses collapsed")
+	}
+	fault := &nodestate.PeerRead{Status: nodestate.PeerUnreadable}
+	if !fault.Configured() {
+		t.Error("PeerUnreadable no longer reports as a deployment fault")
+	}
+}
+
+// TestContract_ConfirmDurabilityAcceptsAHandBuiltDocument covers the shape a
+// consumer gets when it constructs a Document itself rather than loading one.
+//
+// Decoding normalizes an absent reboots array to an empty slice, so without
+// the same normalization on write the candidate encodes differently from what
+// was stored, and ConfirmDurability reports ErrStateChanged against the
+// caller's own write. That reads as "another process touched this file",
+// which under the design means stop.
+func TestContract_ConfirmDurabilityAcceptsAHandBuiltDocument(t *testing.T) {
+	t.Parallel()
+
+	s, _ := newStore(t, nodestate.ComponentSBR)
+	ctx := context.Background()
+
+	doc := &nodestate.Document{Node: "worker-0", NodeUID: "node-uid"} // Reboots nil
+	if err := s.Write(ctx, doc); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.ConfirmDurability(ctx, doc); err != nil {
+		t.Fatalf("ConfirmDurability on this process's own candidate: %v", err)
+	}
+	if doc.Reboots == nil {
+		t.Error("Write did not normalize the nil reboots slice it encoded")
+	}
+
+	// A genuinely different candidate must still be rejected.
+	stale := doc.Clone()
+	stale.Node = "someone-else"
+	if err := s.ConfirmDurability(ctx, stale); !errors.Is(err, nodestate.ErrStateChanged) {
+		t.Errorf("ConfirmDurability on a stale candidate = %v, want ErrStateChanged", err)
+	}
+}
+
+// TestContract_UndatedRebootIsCounted keeps retention and counting agreeing.
+//
+// Retention deliberately keeps a record with no timestamp, on the grounds
+// that an undated reset is more likely a writer that forgot to stamp it than
+// one that never happened. Counting has to follow, or the record is retained
+// forever and never seen by the brake it exists to feed.
+func TestContract_UndatedRebootIsCounted(t *testing.T) {
+	t.Parallel()
+
+	now := time.Date(2024, 6, 1, 12, 0, 0, 0, time.UTC)
+	doc := nodestate.NewDocument(nodestate.ComponentSBR)
+	doc.AppendReboot(nodestate.RebootEntry{Reason: "undated"})
+	doc.AppendReboot(nodestate.RebootEntry{TS: now.Add(-time.Hour), Reason: "dated"})
+	nodestate.DefaultRetention().Apply(doc, now)
+
+	if len(doc.Reboots) != 2 {
+		t.Fatalf("retention kept %d records, want 2", len(doc.Reboots))
+	}
+	if got := nodestate.CountReboots(now.Add(-24*time.Hour), nil, doc); got != 2 {
+		t.Errorf("CountReboots = %d, want 2: the undated record is retained but uncounted", got)
+	}
+	// Narrowing the window does not hide it either: its date is unknown, so
+	// it belongs to every window.
+	if got := nodestate.CountReboots(now.Add(-time.Minute), nil, doc); got != 1 {
+		t.Errorf("CountReboots over a one minute window = %d, want 1 (the undated record)", got)
+	}
+}
+
+// TestContract_SetConditionKeepsANewerPeersFields covers the one collection
+// whose entries are replaced rather than appended, and so the one place the
+// preservation promise could quietly lapse.
+func TestContract_SetConditionKeepsANewerPeersFields(t *testing.T) {
+	t.Parallel()
+
+	const raw = `{"schemaVersion":1,"agent":{"component":"sbr"},` +
+		`"conditions":[{"type":"StorageUnhealthy","status":"True","futureField":{"a":1}}]}`
+
+	var doc nodestate.Document
+	if err := json.Unmarshal([]byte(raw), &doc); err != nil {
+		t.Fatal(err)
+	}
+	doc.SetCondition(nodestate.ConditionEntry{Type: "StorageUnhealthy", Status: "False"})
+
+	out, err := json.Marshal(&doc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(out), "futureField") {
+		t.Errorf("a newer peer's condition field was dropped by SetCondition: %s", out)
+	}
+	if !strings.Contains(string(out), `"status":"False"`) {
+		t.Errorf("the replacement's own value was lost: %s", out)
 	}
 }

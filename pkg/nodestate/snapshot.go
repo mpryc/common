@@ -62,8 +62,13 @@ func (s *Store) Snapshot(ctx context.Context, components ...Component) *Snapshot
 		}
 		read, err := s.LoadPeer(ctx, c)
 		if err != nil {
-			snap.Err = err
-			snap.Peers[c] = &PeerRead{Status: PeerUnreadable, Cause: err}
+			// Cancellation or an unusable component name. The read did not
+			// happen, which leaves the history incomplete, but it is not a
+			// host-path fault and must not be reported as one.
+			if snap.Err == nil {
+				snap.Err = err
+			}
+			snap.Peers[c] = &PeerRead{Status: PeerNotCollected, Cause: err}
 			continue
 		}
 		snap.Peers[c] = read
