@@ -12,8 +12,22 @@
 
 set -euo pipefail
 
+# Evaluate the module as a consumer will get it, not as a local workspace
+# resolves it. A go.work overlay can satisfy an import from a sibling
+# directory, which would hide a dependency that is external to the published
+# module. It also makes "go list -m" print one module per workspace entry,
+# and the multi-line result turned the exemption below into a bare
+# "^github.com/medik8s/common" that matched every package in the repository.
+export GOWORK=off
+
 PACKAGES=(./pkg/nodestate/...)
-MODULE=$(go list -m)
+
+# Ask which module contains the package under test, rather than which modules
+# are in scope. The answer is one line by construction.
+if ! MODULE=$(go list -f '{{.Module.Path}}' ./pkg/nodestate); then
+  echo "verify-nodestate-deps: cannot resolve the module for ./pkg/nodestate"
+  exit 1
+fi
 
 # Resolve the dependency list first. Folding this into the filtering pipeline
 # would let a build failure arrive as an empty list, which the filter then
